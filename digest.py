@@ -3,8 +3,8 @@ Morning Digest
 Consolidated morning email:
 - New deals (WhatsApp and Telegram, grouped by source)
 - New people added since last digest
-- Reading list (unsent links)
-Uses batched sheet updates to avoid Google Sheets rate limits.
+- Reading list with 2-3 sentence summaries of each link
+Uses batched sheet updates.
 """
 import os
 import json
@@ -37,12 +37,12 @@ def get_sheets():
 
 
 def collect_pending_links(sheet):
-    """Links: URL | Title | Captured At | Source Message | Sent in Digest"""
+    """Links: URL | Title | Summary | Captured At | Source Message | Sent in Digest"""
     rows = sheet.get_all_values()
     pending = []
     indices = []
     for i, row in enumerate(rows[1:], start=2):
-        if len(row) < 5 or row[4].strip().upper() != "TRUE":
+        if len(row) < 6 or row[5].strip().upper() != "TRUE":
             pending.append(row)
             indices.append(i)
     return pending, indices
@@ -73,10 +73,6 @@ def collect_new_deals(sheet):
 
 
 def batch_mark_sent(sheet, row_indices, col_letter):
-    """
-    Mark many rows as sent in a single batched API call.
-    col_letter is the column letter of the 'Sent in Digest' column (e.g., 'E', 'G', 'J').
-    """
     if not row_indices:
         return
     updates = [
@@ -126,9 +122,11 @@ def build_html(today, links, people, deals):
         """)
 
     if links:
+        # Links: URL | Title | Summary | Captured At | Source Message | Sent in Digest
         links_html = "\n".join(
-            f'<li><a href="{r[0]}" style="color:#0066cc;">{r[1] or r[0]}</a>'
-            + (f'<br><span style="color:#666;font-size:12px;">{r[3][:120]}</span>' if len(r) > 3 and r[3] else '')
+            f'<li style="margin-bottom:12px;">'
+            f'<a href="{r[0]}" style="color:#0066cc;font-weight:500;">{r[1] or r[0]}</a>'
+            + (f'<br><span style="color:#333;font-size:13px;">{r[2]}</span>' if len(r) > 2 and r[2] else '')
             + '</li>'
             for r in links
         )
@@ -208,6 +206,8 @@ def build_text(today, links, people, deals):
         parts.append(f"READING LIST ({len(links)}):")
         for r in links:
             parts.append(f"- {r[1] or 'Link'}: {r[0]}")
+            if len(r) > 2 and r[2]:
+                parts.append(f"  {r[2]}")
         parts.append("")
     if not people and not links and not deals:
         parts.append("Nothing new this morning.")
@@ -241,9 +241,8 @@ def main():
         smtp.send_message(msg)
     print(f"Sent morning digest: {len(deals)} deals, {len(people)} people, {len(links)} links.")
 
-    # Batched mark-as-sent - single API call per sheet, regardless of row count
     print("Marking rows as sent...")
-    batch_mark_sent(sheets["links"], link_indices, "E")       # Links col 5 = E
+    batch_mark_sent(sheets["links"], link_indices, "F")       # Links col 6 = F (Sent in Digest)
     batch_mark_sent(sheets["people"], people_indices, "G")    # People col 7 = G
     batch_mark_sent(sheets["deals"], deal_indices, "J")       # Deals col 10 = J
     print("Done.")
