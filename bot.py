@@ -45,15 +45,22 @@ EXTRACTION_PROMPT = """You are parsing a personal note someone wrote to themselv
 1. Any PEOPLE mentioned by name (real humans, not companies). For each, give:
    - name: their name as written
    - context: a one-sentence description of who they are or why mentioned, based on the note
+   - types: a list of role/category tags inferred from context. Use lowercase short tags.
+     Common examples: "investor", "vc", "angel", "deal source", "entrepreneur", "founder",
+     "family office", "lp", "operator", "advisor", "lawyer", "banker", "family", "friend",
+     "journalist", "recruiter". Invent new tags if none fit. A person can have multiple types
+     (e.g. ["founder", "deal source"]). If you genuinely cannot infer any type from the
+     context, use an empty list [].
 
 2. Any LINKS (URLs) in the message. For each, give:
    - url: the full URL
    - title: a short guess at what it is (article, video, tool, etc.) based on context
 
 Return ONLY valid JSON in this exact shape, no prose:
-{"people": [{"name": "...", "context": "..."}], "links": [{"url": "...", "title": "..."}]}
+{"people": [{"name": "...", "context": "...", "types": ["...", "..."]}], "links": [{"url": "...", "title": "..."}]}
 
-If there are no people, use []. Same for links. Be conservative — don't invent people who aren't clearly named.
+If there are no people, use []. Same for links. Be conservative — don't invent people who
+aren't clearly named, and don't guess types you have no evidence for.
 
 The note:
 ---
@@ -114,13 +121,16 @@ async def main():
             now = datetime.now(timezone.utc).isoformat()
             preview = msg.text[:200]
 
-            for p in result.get("people", []):
+        for p in result.get("people", []):
                 name = p.get("name", "").strip()
                 if not name or name.lower() in existing_names:
                     continue
-                people_sheet.append_row([name, p.get("context", ""), now, preview, ""])
+                types_list = p.get("types", []) or []
+                types_str = ", ".join(t.strip().lower() for t in types_list if t.strip())
+                # Columns: Name | Context | Type | Notes | First Mentioned | Source Message
+                people_sheet.append_row([name, p.get("context", ""), types_str, "", now, preview])
                 existing_names.add(name.lower())
-                print(f"  + Person: {name}")
+                print(f"  + Person: {name} [{types_str}]")
 
             for l in result.get("links", []):
                 url = l.get("url", "").strip()
