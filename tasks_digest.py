@@ -1,9 +1,9 @@
 """
 Evening Tasks Digest
-Sends an evening email with:
+Evening email with:
 - Tasks captured today (pending)
-- Inbox: items Claude was uncertain about and wants you to manually sort
-Marks both as sent after delivery.
+- Inbox: items Claude was uncertain about
+Uses batched sheet updates.
 """
 import os
 import json
@@ -16,9 +16,10 @@ from google.oauth2.service_account import Credentials
 
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 SA_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-RECIPIENT = os.environ["DIGEST_RECIPIENT"]
+GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"].strip()
+GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"].replace("\xa0", "").replace(" ", "").strip()
+RECIPIENT = os.environ["DIGEST_RECIPIENT"].strip()
+
 
 def get_sheets():
     creds = Credentials.from_service_account_info(
@@ -32,8 +33,9 @@ def get_sheets():
         "inbox": sh.worksheet("Inbox"),
     }
 
+
 def collect_pending_tasks(sheet):
-    """Tasks columns: Task | Created | Due | Status | Source Message"""
+    """Tasks: Task | Created | Due | Status | Source Message"""
     rows = sheet.get_all_values()
     pending = []
     indices = []
@@ -43,8 +45,9 @@ def collect_pending_tasks(sheet):
             indices.append(i)
     return pending, indices
 
+
 def collect_pending_inbox(sheet):
-    """Inbox columns: Type | Content | Reason | Confidence | Source Message | Created | Status"""
+    """Inbox: Type | Content | Reason | Confidence | Source Message | Created | Status"""
     rows = sheet.get_all_values()
     pending = []
     indices = []
@@ -53,6 +56,17 @@ def collect_pending_inbox(sheet):
             pending.append(row)
             indices.append(i)
     return pending, indices
+
+
+def batch_mark_status(sheet, row_indices, col_letter, new_value):
+    if not row_indices:
+        return
+    updates = [
+        {"range": f"{col_letter}{i}", "values": [[new_value]]}
+        for i in row_indices
+    ]
+    sheet.batch_update(updates, value_input_option="USER_ENTERED")
+
 
 def build_html(today, tasks, inbox):
     sections = []
@@ -92,6 +106,7 @@ def build_html(today, tasks, inbox):
     </body></html>
     """
 
+
 def build_text(today, tasks, inbox):
     parts = [f"Evening review - {today}\n"]
     if tasks:
@@ -110,6 +125,7 @@ def build_text(today, tasks, inbox):
     if not tasks and not inbox:
         parts.append("Nothing pending tonight.")
     return "\n".join(parts)
+
 
 def main():
     sheets = get_sheets()
@@ -137,12 +153,11 @@ def main():
         smtp.send_message(msg)
     print(f"Sent evening digest: {len(tasks)} tasks, {len(inbox)} inbox items.")
 
-    # Mark as sent
-    for i in task_indices:
-        sheets["tasks"].update_cell(i, 4, "sent")
-    for i in inbox_indices:
-        sheets["inbox"].update_cell(i, 7, "sent")
-    print("Marked rows as sent.")
+    print("Marking rows as sent...")
+    batch_mark_status(sheets["tasks"], task_indices, "D", "sent")   # Tasks col 4 = D
+    batch_mark_status(sheets["inbox"], inbox_indices, "G", "sent")  # Inbox col 7 = G
+    print("Done.")
+
 
 if __name__ == "__main__":
     main()
