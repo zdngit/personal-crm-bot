@@ -1,13 +1,11 @@
 """
-Weekly Cost Report
-Reads the Costs tab, generates charts with matplotlib, and emails a
-weekly analysis every Sunday evening.
+Weekly Cost & Health Report
+Combines system health checks with cost analysis. Emailed Sunday evening.
 
-Charts:
-  1. Daily spend for the past 7 days (bar chart)
-  2. Cost breakdown by category for the past 7 days (pie chart)
-  3. Cost by script for the past 7 days (horizontal bar)
-  4. Cumulative monthly run-rate (line chart of spend-to-date vs days)
+Includes:
+  - System health section (library versions, Python EOL, model availability, silent-failure detection)
+  - Weekly spend summary
+  - 4 charts: daily spend, category pie, by-script bar, month-to-date line
 """
 import os
 import io
@@ -18,11 +16,13 @@ from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 import matplotlib
-matplotlib.use("Agg")  # Headless
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import gspread
 from google.oauth2.service_account import Credentials
+
+from health_check import run_health_checks, build_health_html, build_health_text
 
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 SA_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
@@ -30,7 +30,6 @@ GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"].strip()
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"].replace("\xa0", "").replace(" ", "").strip()
 RECIPIENT = os.environ["DIGEST_RECIPIENT"].strip()
 
-# Matplotlib style
 plt.rcParams.update({
     "figure.facecolor": "white",
     "axes.facecolor": "white",
@@ -55,7 +54,6 @@ def get_sheet():
 
 
 def load_cost_rows(sheet):
-    """Costs: Timestamp | Script | Category | Model | Input | Output | Cost USD"""
     rows = sheet.get_all_values()
     records = []
     for row in rows[1:]:
@@ -88,7 +86,6 @@ def fig_to_png_bytes(fig):
 
 
 def chart_daily_spend(records, week_start):
-    """Bar chart: cost per day for the past 7 days."""
     by_day = defaultdict(float)
     for r in records:
         day = r["timestamp"].date()
@@ -113,7 +110,6 @@ def chart_daily_spend(records, week_start):
 
 
 def chart_category_breakdown(records):
-    """Pie chart: cost by category."""
     by_cat = defaultdict(float)
     for r in records:
         by_cat[r["category"] or "uncategorized"] += r["cost"]
@@ -142,7 +138,6 @@ def chart_category_breakdown(records):
 
 
 def chart_by_script(records):
-    """Horizontal bar: cost by script."""
     by_script = defaultdict(float)
     for r in records:
         by_script[r["script"] or "unknown"] += r["cost"]
@@ -167,7 +162,6 @@ def chart_by_script(records):
 
 
 def chart_monthly_runrate(all_records):
-    """Cumulative spend for the current calendar month with projection."""
     now = datetime.now(timezone.utc)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
@@ -175,9 +169,8 @@ def chart_monthly_runrate(all_records):
     if not month_records:
         return None
 
-    # Days in month so far
     days_so_far = (now - month_start).days + 1
-    days_in_month = 30  # Rough; good enough for a projection
+    days_in_month = 30
 
     by_day = defaultdict(float)
     for r in month_records:
@@ -191,7 +184,6 @@ def chart_monthly_runrate(all_records):
         total += by_day.get(i, 0.0)
         cumulative.append(total)
 
-    # Projection line based on current pace
     if days_so_far > 0 and total > 0:
         projected_eom = total * (days_in_month / days_so_far)
         proj_x = [days_so_far - 1, days_in_month - 1]
@@ -215,16 +207,14 @@ def chart_monthly_runrate(all_records):
     return fig_to_png_bytes(fig)
 
 
-def build_email(records, week_start, week_end, all_records):
-    """Build the email with embedded chart images."""
+def build_email(records, week_start, week_end, all_records, health_checks):
     week_records = [r for r in records if week_start <= r["timestamp"] < week_end]
 
     week_total = sum(r["cost"] for r in week_records)
     week_calls = len(week_records)
-    week_input_tokens = sum(r["input_tokens"] for r in week_records)
-    week_output_tokens = sum(r["output_tokens"] for r in week_records)
+    week_input = sum(r["input_tokens"] for r in week_records)
+    week_output = sum(r["output_tokens"] for r in week_records)
 
-    # Previous week for comparison
     prev_start = week_start - timedelta(days=7)
     prev_records = [r for r in records if prev_start <= r["timestamp"] < week_start]
     prev_total = sum(r["cost"] for r in prev_records)
@@ -235,22 +225,51 @@ def build_email(records, week_start, week_end, all_records):
     else:
         wow_text = "no comparison (first week of data)"
 
-    # Month-to-date
     now = datetime.now(timezone.utc)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     mtd_total = sum(r["cost"] for r in all_records if r["timestamp"] >= month_start)
 
-    # Generate charts
     print("Generating charts...")
-    chart_daily = chart_daily_spend(week_records, week_start)
+    chart_daily = chart_daily_spend(week_records, week_start) if week_records else None
     chart_cat = chart_category_breakdown(week_records)
     chart_scripts = chart_by_script(week_records)
     chart_month = chart_monthly_runrate(all_records)
 
-    # Build HTML with inline image references
+    health_html = build_health_html(health_checks)
+    health_text = build_health_text(health_checks)
+
+    # Determine overall health for subject line
+    status_order = {"ok": 0, "warning": 1, "critical": 2}
+    overall_status = max(health_checks, key=lambda c: status_order.get(c["status"], 0))["status"]
+    subject_prefix = {
+        "ok": "",
+        "warning": "[!] ",
+        "critical": "[X] ",
+    }[overall_status]
+
+    charts_section = ""
+    if week_records:
+        charts_section = f"""
+        <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;">Daily spend</h3>
+        <img src="cid:chart_daily" style="width:100%;max-width:680px;">
+
+        <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;">Where it went</h3>
+        <table width="100%"><tr>
+          <td width="50%" style="vertical-align:top;"><img src="cid:chart_cat" style="width:100%;"></td>
+          <td width="50%" style="vertical-align:top;"><img src="cid:chart_scripts" style="width:100%;"></td>
+        </tr></table>
+
+        <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;">Month-to-date</h3>
+        <img src="cid:chart_month" style="width:100%;max-width:680px;">
+        """
+    else:
+        charts_section = '<p style="color:#999;">No cost data this week yet.</p>'
+
     html = f"""
     <html><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:720px;margin:auto;color:#222;">
-    <h2 style="color:#111;">Weekly cost report - {week_end.strftime('%B %d, %Y')}</h2>
+    <h2 style="color:#111;">Weekly report - {week_end.strftime('%B %d, %Y')}</h2>
+
+    {health_html}
 
     <div style="background:#f5f7fa;padding:16px 20px;border-radius:8px;margin:16px 0;">
     <div style="font-size:28px;font-weight:600;color:#111;">${week_total:.2f}</div>
@@ -258,31 +277,23 @@ def build_email(records, week_start, week_end, all_records):
     <div style="color:#666;font-size:13px;margin-top:4px;">Month-to-date: ${mtd_total:.2f}</div>
     </div>
 
-    <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;">Daily spend</h3>
-    <img src="cid:chart_daily" style="width:100%;max-width:680px;">
+    {charts_section}
 
-    <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;">Where it went</h3>
-    <table width="100%"><tr>
-      <td width="50%" style="vertical-align:top;"><img src="cid:chart_cat" style="width:100%;"></td>
-      <td width="50%" style="vertical-align:top;"><img src="cid:chart_scripts" style="width:100%;"></td>
-    </tr></table>
-
-    <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;">Month-to-date</h3>
-    <img src="cid:chart_month" style="width:100%;max-width:680px;">
-
-    <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;">Token usage</h3>
+    <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;">Token usage (past 7 days)</h3>
     <table style="font-size:13px;color:#444;border-collapse:collapse;width:100%;">
-      <tr><td style="padding:4px 0;">Input tokens</td><td style="text-align:right;">{week_input_tokens:,}</td></tr>
-      <tr><td style="padding:4px 0;">Output tokens</td><td style="text-align:right;">{week_output_tokens:,}</td></tr>
-      <tr><td style="padding:4px 0;">Total tokens</td><td style="text-align:right;">{week_input_tokens + week_output_tokens:,}</td></tr>
+      <tr><td style="padding:4px 0;">Input tokens</td><td style="text-align:right;">{week_input:,}</td></tr>
+      <tr><td style="padding:4px 0;">Output tokens</td><td style="text-align:right;">{week_output:,}</td></tr>
+      <tr><td style="padding:4px 0;">Total tokens</td><td style="text-align:right;">{week_input + week_output:,}</td></tr>
     </table>
 
-    <p style="color:#999;font-size:11px;margin-top:30px;">Sent by your personal CRM bot. Raw data in the Costs tab of your sheet.</p>
+    <p style="color:#999;font-size:11px;margin-top:30px;">Sent by your personal CRM bot. Raw data in the Costs tab.</p>
     </body></html>
     """
 
-    text = f"""Weekly cost report - {week_end.strftime('%B %d, %Y')}
+    text = f"""Weekly report - {week_end.strftime('%B %d, %Y')}
 
+{health_text}
+SPEND
 Past 7 days: ${week_total:.2f}
 API calls: {week_calls}
 {wow_text}
@@ -290,21 +301,18 @@ API calls: {week_calls}
 Month-to-date: ${mtd_total:.2f}
 
 Token usage:
-  Input: {week_input_tokens:,}
-  Output: {week_output_tokens:,}
-  Total: {week_input_tokens + week_output_tokens:,}
-
-Raw data in the Costs tab of your sheet.
+  Input: {week_input:,}
+  Output: {week_output:,}
+  Total: {week_input + week_output:,}
 """
 
     msg = EmailMessage()
-    msg["Subject"] = f"Cost report - week of {week_end.strftime('%b %d')} (${week_total:.2f})"
+    msg["Subject"] = f"{subject_prefix}Weekly report - {week_end.strftime('%b %d')} (${week_total:.2f})"
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = RECIPIENT
     msg.set_content(text)
     msg.add_alternative(html, subtype="html")
 
-    # Attach charts inline
     html_part = msg.get_payload()[1]
     if chart_daily:
         html_part.add_related(chart_daily, maintype="image", subtype="png", cid="chart_daily")
@@ -319,23 +327,23 @@ Raw data in the Costs tab of your sheet.
 
 
 def main():
+    # Run health checks first - these are the most important
+    health_checks = run_health_checks()
+
+    # Then cost data
     sheet = get_sheet()
     records = load_cost_rows(sheet)
-
-    if not records:
-        print("No cost data yet. Skipping report.")
-        return
 
     now = datetime.now(timezone.utc)
     week_end = now.replace(hour=23, minute=59, second=59, microsecond=0)
     week_start = (week_end - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    msg = build_email(records, week_start, week_end, records)
+    msg = build_email(records, week_start, week_end, records, health_checks)
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
         smtp.send_message(msg)
-    print("Sent weekly cost report.")
+    print("Sent weekly report.")
 
 
 if __name__ == "__main__":
