@@ -1,10 +1,10 @@
 """
 Morning Digest
 Consolidated morning email:
+- New deals (WhatsApp and Telegram, grouped by source)
 - New people added since last digest
 - Reading list (unsent links)
-- New deals (from WhatsApp and Telegram)
-Marks links, people, and deals as sent after delivery.
+Uses batched sheet updates to avoid Google Sheets rate limits.
 """
 import os
 import json
@@ -17,9 +17,9 @@ from google.oauth2.service_account import Credentials
 
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 SA_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-RECIPIENT = os.environ["DIGEST_RECIPIENT"]
+GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"].strip()
+GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"].replace("\xa0", "").replace(" ", "").strip()
+RECIPIENT = os.environ["DIGEST_RECIPIENT"].strip()
 
 
 def get_sheets():
@@ -61,7 +61,7 @@ def collect_new_people(sheet):
 
 
 def collect_new_deals(sheet):
-    """Deals: Company | Terms | Direction | Timeline | Deal Type | Mentioned By | Source | Captured At | Source Message | Sent in Digest"""
+    """Deals: Company | Terms | Direction | Timeline | Deal Type | Mentioned By | Source | Captured | Source Message | Sent in Digest"""
     rows = sheet.get_all_values()
     new_deals = []
     indices = []
@@ -72,11 +72,24 @@ def collect_new_deals(sheet):
     return new_deals, indices
 
 
+def batch_mark_sent(sheet, row_indices, col_letter):
+    """
+    Mark many rows as sent in a single batched API call.
+    col_letter is the column letter of the 'Sent in Digest' column (e.g., 'E', 'G', 'J').
+    """
+    if not row_indices:
+        return
+    updates = [
+        {"range": f"{col_letter}{i}", "values": [["TRUE"]]}
+        for i in row_indices
+    ]
+    sheet.batch_update(updates, value_input_option="USER_ENTERED")
+
+
 def build_html(today, links, people, deals):
     sections = []
 
     if deals:
-        # Group deals by source
         wa_deals = [d for d in deals if len(d) > 6 and d[6].lower() == "whatsapp"]
         tg_deals = [d for d in deals if len(d) > 6 and d[6].lower() == "telegram"]
 
@@ -136,8 +149,6 @@ def build_html(today, links, people, deals):
 
 
 def _format_deal(d):
-    """Format a single deal row as an <li>."""
-    # Columns: Company | Terms | Direction | Timeline | Deal Type | Mentioned By | Source | Captured | Source Message | Sent
     company = d[0] if len(d) > 0 else ""
     terms = d[1] if len(d) > 1 else ""
     direction = d[2] if len(d) > 2 else ""
@@ -230,14 +241,12 @@ def main():
         smtp.send_message(msg)
     print(f"Sent morning digest: {len(deals)} deals, {len(people)} people, {len(links)} links.")
 
-    # Mark as sent
-    for i in link_indices:
-        sheets["links"].update_cell(i, 5, "TRUE")
-    for i in people_indices:
-        sheets["people"].update_cell(i, 7, "TRUE")
-    for i in deal_indices:
-        sheets["deals"].update_cell(i, 10, "TRUE")
-    print("Marked rows as sent.")
+    # Batched mark-as-sent - single API call per sheet, regardless of row count
+    print("Marking rows as sent...")
+    batch_mark_sent(sheets["links"], link_indices, "E")       # Links col 5 = E
+    batch_mark_sent(sheets["people"], people_indices, "G")    # People col 7 = G
+    batch_mark_sent(sheets["deals"], deal_indices, "J")       # Deals col 10 = J
+    print("Done.")
 
 
 if __name__ == "__main__":
