@@ -1,8 +1,7 @@
 """
 Personal CRM Bot
 Reads new messages from Telegram Saved Messages, extracts people, links,
-and tasks via Claude. Low-confidence or ambiguous items go to an Inbox tab
-for manual review in the evening digest.
+tasks, and ideas via Claude. Low-confidence items go to an Inbox tab.
 """
 import os
 import json
@@ -17,7 +16,7 @@ from google.oauth2.service_account import Credentials
 
 from anthropic import Anthropic
 
-# --- Config from environment ---
+# --- Config ---
 API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
 SESSION = os.environ["TELEGRAM_SESSION"]
@@ -26,9 +25,9 @@ SA_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 STATE_FILE = "state.json"
-CONFIDENCE_THRESHOLD = 0.7  # Below this -> Inbox for manual review
+CONFIDENCE_THRESHOLD = 0.7
 
-# --- Google Sheets setup ---
+# --- Sheets ---
 def get_sheets():
     creds = Credentials.from_service_account_info(
         json.loads(SA_JSON),
@@ -40,64 +39,59 @@ def get_sheets():
         "people": sh.worksheet("People"),
         "links": sh.worksheet("Links"),
         "tasks": sh.worksheet("Tasks"),
+        "ideas": sh.worksheet("Ideas"),
         "inbox": sh.worksheet("Inbox"),
     }
 
-# --- Claude extraction ---
+# --- Claude ---
 client_ai = Anthropic(api_key=ANTHROPIC_KEY)
 
-EXTRACTION_PROMPT = """You are parsing a personal note someone wrote to themselves. They use this notes channel for THREE distinct purposes:
+EXTRACTION_PROMPT = """You are parsing a personal note someone wrote to themselves. They use this notes channel for FOUR distinct purposes:
 
 A) ADDING A PERSON to their CRM. Signals: "add X to people", "met X", introducing a new contact, describing who someone is or what they do. The note is ABOUT a person.
 
 B) SAVING A LINK to read later. Signals: a URL is present, optionally with a few words of context.
 
-C) CAPTURING A TASK they need to do. Signals: imperative phrasing directed at themselves like "email X", "book Y", "remind me to Z", "need to ...", "follow up", "draft the memo", "call the lawyer".
+C) CAPTURING A TASK they need to do. Signals: imperative phrasing directed at themselves like "email X", "book Y", "remind me to Z", "need to ...", "follow up", "draft the memo".
 
-HARD TASK MARKERS: If the note begins with or contains any of these markers, it is DEFINITELY a task and you must extract it as a task, not a person:
-- "todo:", "TODO:", "todo "
-- "remind me to"
-- "need to", "have to", "must"
-- "don't forget to"
-- "follow up"
-A note like "Todo: email Gerard" is a task ("Email Gerard"), NOT a person named Gerard. The person mentioned in a task is the OBJECT of the action, not a CRM entry.
+D) CAPTURING AN IDEA - a speculative thought, hypothesis, observation, or musing they want to revisit later. Signals: "what if X", "idea: X", "could be cool to X", "interesting that X", "wonder whether X", "X might be a good business", or any reflective thought that isn't a task or a person description.
 
-DISAMBIGUATION RULE: If a note is primarily ADDING A PERSON, do NOT also extract a task from it. Examples:
-- "Add Sarah Chen to people - she can intro me to founders at Sequoia" -> ONE person, ZERO tasks.
-- "Email Sarah about the deck tomorrow" -> ZERO people, ONE task.
-- "Todo: email Gerard" -> ZERO people, ONE task ("Email Gerard").
-- "Met Sarah Chen at Sequoia. Need to email her the deck by Friday." -> ONE person AND ONE task.
+HARD TASK MARKERS: If the note contains any of: "todo:", "TODO:", "remind me to", "need to", "have to", "must", "don't forget to", "follow up" - it is a TASK, not an idea or person.
 
-NAME FIDELITY RULE: When extracting a person's name, copy it verbatim from the source text. Do not correct spelling, do not guess at full names, do not substitute similar-sounding words. If the source says "Gerard", the name is "Gerard" - never "Harare" or "Gerald". If you cannot find an exact name, do not extract a person.
+DISAMBIGUATION RULES:
+- A note that ADDS A PERSON should not also produce a task or idea, even if it describes the person's work. "Met Sarah, she's working on agentic AI" -> ONE person, ZERO ideas.
+- A note that captures a TASK should not also produce an idea about the task's subject. "Need to research agentic AI tools" -> ONE task, ZERO ideas.
+- An IDEA stands alone: it is not directed at anyone, is not an action item, and is not adding a contact. It is the writer thinking out loud.
+- If a note is clearly a musing AND mentions a person tangentially ("interesting how Sarah's approach to fundraising works - might be a model for us"), extract it as ONE idea, ZERO people.
 
-CONFIDENCE: For each extracted item, include a confidence score from 0.0 to 1.0:
-- 0.9-1.0: Clear, unambiguous. The note explicitly states this is a person/task/link.
-- 0.7-0.89: Confident but some ambiguity (e.g., person mentioned without much context, task without clear due date).
-- 0.5-0.69: Uncertain. Could plausibly be classified differently. Include the item but flag it for review.
-- Below 0.5: Do NOT extract. Skip the item entirely.
+Examples:
+- "Add Sarah Chen to people - partner at Sequoia" -> 1 person, 0 ideas, 0 tasks
+- "Email Sarah about the deck" -> 0 people, 1 task, 0 ideas
+- "What if we restructured the fund to allow for longer hold periods" -> 0 everything, 1 idea
+- "Interesting framing from Patrick OShaughnessys podcast - capital is patient when LPs are aligned" -> 0 people, 0 tasks, 1 idea
+- "Idea: a tool that auto-summarizes board decks" -> 1 idea
+- "Met Marcus, runs a family office. Could be a deal source. Also makes me think we should formalize our intro process." -> 1 person AND 1 idea (the formalization thought is separate from describing Marcus)
 
-Items below 0.7 confidence will be routed to an Inbox tab for the user to manually sort. Use this when you are genuinely unsure, NOT to be lazy - if a note is clearly a task, give it 0.9+, don't hedge.
+NAME FIDELITY: When extracting a person's name, copy it verbatim from the source. Never invent or substitute. If you cannot find an exact name, do not extract a person.
+
+CONFIDENCE: For each extracted item, include a confidence score 0.0-1.0:
+- 0.9-1.0: Clear and unambiguous
+- 0.7-0.89: Confident but some ambiguity
+- 0.5-0.69: Uncertain, route to Inbox for manual review
+- Below 0.5: Do not extract
 
 Extract:
 
-1. PEOPLE - real humans named in the note (only when the note is ABOUT them). For each:
-   - name: copied verbatim from source
-   - context: one sentence on who they are
-   - types: lowercase tags. Common: "investor", "vc", "angel", "deal source", "entrepreneur", "founder", "family office", "lp", "operator", "advisor", "lawyer", "banker", "family", "friend", "journalist", "recruiter". Multiple allowed. Empty list if no signal.
-   - confidence: 0.0 to 1.0
+1. PEOPLE - real humans the note is ABOUT. Each: name (verbatim), context (one sentence), types (lowercase tags from: investor, vc, angel, deal source, entrepreneur, founder, family office, lp, operator, advisor, lawyer, banker, family, friend, journalist, recruiter; multiple allowed; empty if none), confidence.
 
-2. LINKS - URLs in the note. For each:
-   - url: the full URL
-   - title: short guess at what it is
-   - confidence: 0.0 to 1.0 (URLs are almost always 0.95+)
+2. LINKS - URLs in the note. Each: url, title (short guess), confidence.
 
-3. TASKS - action items the writer needs to do. For each:
-   - task: rewrite as a clear imperative starting with a verb
-   - due: any date/time in natural language, or empty string
-   - confidence: 0.0 to 1.0
+3. TASKS - action items the writer needs to do. Each: task (rewrite as imperative), due (natural language date or empty), confidence.
+
+4. IDEAS - speculative thoughts, hypotheses, observations, or musings. Each: idea (rewrite as a clear statement, preserving the original thought), confidence.
 
 Return ONLY valid JSON, no prose:
-{"people": [{"name": "...", "context": "...", "types": ["..."], "confidence": 0.95}], "links": [{"url": "...", "title": "...", "confidence": 0.99}], "tasks": [{"task": "...", "due": "...", "confidence": 0.9}]}
+{"people": [{"name":"...","context":"...","types":["..."],"confidence":0.95}], "links": [{"url":"...","title":"...","confidence":0.99}], "tasks": [{"task":"...","due":"...","confidence":0.9}], "ideas": [{"idea":"...","confidence":0.85}]}
 
 Use [] for any category with no items. Be conservative - do not invent.
 
@@ -121,7 +115,7 @@ def extract(message_text):
         return json.loads(text.strip())
     except json.JSONDecodeError:
         print(f"  ! JSON parse failed. Raw response: {text[:300]}")
-        return {"people": [], "links": [], "tasks": []}
+        return {"people": [], "links": [], "tasks": [], "ideas": []}
 
 # --- State ---
 def load_state():
@@ -167,19 +161,14 @@ async def main():
                 types_list = p.get("types", []) or []
                 types_str = ", ".join(x.strip().lower() for x in types_list if x.strip())
                 context = p.get("context", "")
-
                 if conf < CONFIDENCE_THRESHOLD:
-                    # Inbox: Type | Content | Reason | Confidence | Source Message | Created | Status
                     sheets["inbox"].append_row([
                         "person", f"{name} - {context} [{types_str}]",
                         f"Low confidence ({conf:.2f})", str(conf), preview, now, "pending"
                     ])
                     print(f"  ? Inbox (person): {name} [conf={conf:.2f}]")
                 else:
-                    # People: Name | Context | Type | Notes | First Mentioned | Source Message | Sent in Digest
-                    sheets["people"].append_row([
-                        name, context, types_str, "", now, preview, "FALSE"
-                    ])
+                    sheets["people"].append_row([name, context, types_str, "", now, preview, "FALSE"])
                     existing_names.add(name.lower())
                     print(f"  + Person: {name} [{types_str}] [conf={conf:.2f}]")
 
@@ -189,7 +178,6 @@ async def main():
                     continue
                 conf = float(link.get("confidence", 1.0))
                 title = link.get("title", "")
-
                 if conf < CONFIDENCE_THRESHOLD:
                     sheets["inbox"].append_row([
                         "link", f"{url} - {title}",
@@ -207,7 +195,6 @@ async def main():
                     continue
                 conf = float(t.get("confidence", 1.0))
                 due = t.get("due", "").strip()
-
                 if conf < CONFIDENCE_THRESHOLD:
                     sheets["inbox"].append_row([
                         "task", f"{task_text}" + (f" (due {due})" if due else ""),
@@ -217,6 +204,22 @@ async def main():
                 else:
                     sheets["tasks"].append_row([task_text, now, due, "pending", preview])
                     print(f"  + Task: {task_text} (due: {due or 'none'}) [conf={conf:.2f}]")
+
+            for idea in result.get("ideas", []):
+                idea_text = idea.get("idea", "").strip()
+                if not idea_text:
+                    continue
+                conf = float(idea.get("confidence", 1.0))
+                if conf < CONFIDENCE_THRESHOLD:
+                    sheets["inbox"].append_row([
+                        "idea", idea_text,
+                        f"Low confidence ({conf:.2f})", str(conf), preview, now, "pending"
+                    ])
+                    print(f"  ? Inbox (idea): {idea_text[:60]} [conf={conf:.2f}]")
+                else:
+                    # Ideas: Idea | Created | Source Message | Sent in Digest
+                    sheets["ideas"].append_row([idea_text, now, preview, "FALSE"])
+                    print(f"  + Idea: {idea_text[:60]} [conf={conf:.2f}]")
 
             state["last_id"] = max(state["last_id"], msg.id)
 
