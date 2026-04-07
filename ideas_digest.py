@@ -1,7 +1,7 @@
 """
 Weekly Ideas Digest
-Sends a Sunday evening email with all ideas captured since the last Sunday digest.
-Marks ideas as sent after delivery.
+Sunday evening email with ideas captured since the last Sunday digest.
+Uses batched sheet updates.
 """
 import os
 import json
@@ -14,9 +14,10 @@ from google.oauth2.service_account import Credentials
 
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 SA_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-RECIPIENT = os.environ["DIGEST_RECIPIENT"]
+GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"].strip()
+GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"].replace("\xa0", "").replace(" ", "").strip()
+RECIPIENT = os.environ["DIGEST_RECIPIENT"].strip()
+
 
 def get_ideas_sheet():
     creds = Credentials.from_service_account_info(
@@ -26,6 +27,17 @@ def get_ideas_sheet():
     gc = gspread.authorize(creds)
     return gc.open_by_key(SHEET_ID).worksheet("Ideas")
 
+
+def batch_mark_sent(sheet, row_indices, col_letter):
+    if not row_indices:
+        return
+    updates = [
+        {"range": f"{col_letter}{i}", "values": [["TRUE"]]}
+        for i in row_indices
+    ]
+    sheet.batch_update(updates, value_input_option="USER_ENTERED")
+
+
 def main():
     sheet = get_ideas_sheet()
     rows = sheet.get_all_values()
@@ -33,7 +45,7 @@ def main():
         print("No ideas yet.")
         return
 
-    # Ideas columns: Idea | Created | Source Message | Sent in Digest
+    # Ideas: Idea | Created | Source Message | Sent in Digest
     pending = []
     indices = []
     for i, row in enumerate(rows[1:], start=2):
@@ -57,7 +69,7 @@ def main():
     <h2 style="color:#111;">Weekly ideas review - {today}</h2>
     <p style="color:#666;">{len(pending)} idea{'s' if len(pending) != 1 else ''} captured this week. Take a few minutes to revisit:</p>
     <ul style="padding-left:20px;">{items_html}</ul>
-    <p style="color:#999;font-size:11px;margin-top:30px;">Sent by your personal CRM bot. Browse the Ideas tab in your sheet for the full archive.</p>
+    <p style="color:#999;font-size:11px;margin-top:30px;">Sent by your personal CRM bot.</p>
     </body></html>
     """
 
@@ -78,9 +90,10 @@ def main():
         smtp.send_message(msg)
     print(f"Sent ideas digest with {len(pending)} ideas.")
 
-    for i in indices:
-        sheet.update_cell(i, 4, "TRUE")
-    print("Marked rows as sent.")
+    print("Marking rows as sent...")
+    batch_mark_sent(sheet, indices, "D")  # Ideas col 4 = D
+    print("Done.")
+
 
 if __name__ == "__main__":
     main()
