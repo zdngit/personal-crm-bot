@@ -2,10 +2,10 @@ name: Personal CRM Bot
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # Every 30 min - pull new messages
-    - cron: "0 7 * * *"      # 07:00 UTC daily - morning digest
-    - cron: "0 17 * * *"     # 17:00 UTC daily - evening tasks digest
-    - cron: "0 17 * * 0"     # 17:00 UTC Sunday - weekly ideas digest
+    - cron: "*/30 * * * *"
+    - cron: "0 7 * * *"
+    - cron: "0 17 * * *"
+    - cron: "0 17 * * 0"
   workflow_dispatch:
 
 jobs:
@@ -67,7 +67,7 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           DIGEST_RECIPIENT: ${{ secrets.DIGEST_RECIPIENT }}
 
-  ideas_digest:
+  sunday_reports:
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 17 * * 0'
     runs-on: ubuntu-latest
     steps:
@@ -77,6 +77,13 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements.txt
       - run: python ideas_digest.py
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          DIGEST_RECIPIENT: ${{ secrets.DIGEST_RECIPIENT }}
+      - run: python cost_report.py
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
