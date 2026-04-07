@@ -3,14 +3,14 @@ name: Personal CRM Bot
 on:
   schedule:
     - cron: "*/30 * * * *"   # Every 30 min - pull new messages
-    - cron: "0 7 * * *"      # 07:00 UTC daily - morning digest (08:00 London BST)
-    - cron: "0 17 * * *"     # 17:00 UTC daily - evening digest (18:00 London BST)
-    - cron: "0 17 * * 0"     # 17:00 UTC Sunday - weekly ideas digest (18:00 London BST)
+    - cron: "0 7 * * *"      # 07:00 UTC daily - morning digest
+    - cron: "0 17 * * *"     # 17:00 UTC daily - evening tasks digest
+    - cron: "0 17 * * 0"     # 17:00 UTC Sunday - weekly ideas digest
   workflow_dispatch:
 
 jobs:
   ingest:
-    if: github.event.schedule != '0 7 * * *' && github.event.schedule != '0 17 * * *' && github.event.schedule != '0 17 * * 0'
+    if: github.event_name == 'workflow_dispatch' || (github.event.schedule != '0 7 * * *' && github.event.schedule != '0 17 * * *' && github.event.schedule != '0 17 * * 0')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,7 +34,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
   morning_digest:
-    if: github.event.schedule == '0 7 * * *'
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 7 * * *'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,8 +51,7 @@ jobs:
           DIGEST_RECIPIENT: ${{ secrets.DIGEST_RECIPIENT }}
 
   evening_digest:
-    # Daily 17:00 UTC, but NOT Sundays (Sunday slot belongs to ideas digest)
-    if: github.event.schedule == '0 17 * * *'
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 17 * * *'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,7 +68,7 @@ jobs:
           DIGEST_RECIPIENT: ${{ secrets.DIGEST_RECIPIENT }}
 
   ideas_digest:
-    if: github.event.schedule == '0 17 * * 0'
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 17 * * 0'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,13 +76,6 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - run: python tasks_digest.py
-        env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          DIGEST_RECIPIENT: ${{ secrets.DIGEST_RECIPIENT }}
       - run: python ideas_digest.py
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
