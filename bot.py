@@ -1,7 +1,7 @@
 """
 Personal CRM Bot
-Reads new messages from Telegram Saved Messages, extracts people and links
-via Claude, writes them to a Google Sheet.
+Reads new messages from Telegram Saved Messages, extracts people, links,
+and tasks via Claude, writes them to a Google Sheet.
 """
 import os
 import json
@@ -34,31 +34,50 @@ def get_sheets():
     )
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SHEET_ID)
-    return sh.worksheet("People"), sh.worksheet("Links")
+    return (
+        sh.worksheet("People"),
+        sh.worksheet("Links"),
+        sh.worksheet("Tasks"),
+    )
 
 # --- Claude extraction ---
 client_ai = Anthropic(api_key=ANTHROPIC_KEY)
 
-EXTRACTION_PROMPT = """You are parsing a personal note someone wrote to themselves. Extract:
+EXTRACTION_PROMPT = """You are parsing a personal note someone wrote to themselves. They use this notes channel for THREE distinct purposes, and you must classify carefully. A single note usually serves ONE purpose, occasionally two, rarely all three.
 
-1. Any PEOPLE mentioned by name (real humans, not companies). For each, give:
-   - name: their name as written
-   - context: a one-sentence description of who they are or why mentioned, based on the note
-   - types: a list of role/category tags inferred from context. Use lowercase short tags.
-     Common examples: "investor", "vc", "angel", "deal source", "entrepreneur", "founder",
-     "family office", "lp", "operator", "advisor", "lawyer", "banker", "family", "friend",
-     "journalist", "recruiter". Invent new tags if none fit. A person can have multiple types
-     (e.g. ["founder", "deal source"]). If you genuinely cannot infer any type from the
-     context, use an empty list [].
+The three purposes are:
 
-2. Any LINKS (URLs) in the message. For each, give:
+A) ADDING A PERSON to their CRM. Signals: "add X to people", "met X", "X is interesting", introducing a new contact, describing who someone is or what they do. The note is ABOUT a person.
+
+B) SAVING A LINK to read later. Signals: a URL is present, optionally with a few words of context about what it is.
+
+C) CAPTURING A TASK they need to do. Signals: imperative phrasing directed at themselves like "email X", "book Y", "remind me to Z", "todo: ...", "need to ...", "follow up with X about Y", "draft the memo", "call the lawyer". The note is about an ACTION the writer needs to take.
+
+CRITICAL DISAMBIGUATION RULE: If a note is primarily ADDING A PERSON (purpose A), do NOT also extract a task from it, even if the description of the person sounds action-adjacent. For example:
+- "Add Sarah Chen to people - she can intro me to founders at Sequoia" -> ONE person (Sarah), ZERO tasks. The intro is a description of Sarah's usefulness, not a task.
+- "Met Marcus at dinner, he runs a family office and wants to invest in AI" -> ONE person, ZERO tasks.
+- "Email Sarah about the deck tomorrow" -> ZERO people, ONE task.
+- "Met Sarah Chen at Sequoia. Need to email her the deck by Friday." -> ONE person AND ONE task (these are clearly separate clauses).
+
+Extract:
+
+1. PEOPLE - real humans named in the note. For each:
+   - name: as written
+   - context: one sentence on who they are or why they're being added
+   - types: lowercase tags inferred from context. Common: "investor", "vc", "angel", "deal source", "entrepreneur", "founder", "family office", "lp", "operator", "advisor", "lawyer", "banker", "family", "friend", "journalist", "recruiter". Multiple allowed. Empty list if no signal.
+
+2. LINKS - URLs in the note. For each:
    - url: the full URL
-   - title: a short guess at what it is (article, video, tool, etc.) based on context
+   - title: short guess at what it is, based on surrounding context
 
-Return ONLY valid JSON in this exact shape, no prose:
-{"people": [{"name": "...", "context": "...", "types": ["...", "..."]}], "links": [{"url": "...", "title": "..."}]}
+3. TASKS - action items the writer needs to do themselves. For each:
+   - task: rewrite the action as a clear imperative starting with a verb (e.g., "Email Sarah the deck")
+   - due: any date/time mentioned in natural language (e.g., "Friday", "tomorrow", "next week"), or empty string if none
 
-If there are no people, use []. Same for links. Be conservative.
+Return ONLY valid JSON, no prose:
+{"people": [{"name": "...", "context": "...", "types": ["..."]}], "links": [{"url": "...", "title": "..."}], "tasks": [{"task": "...", "due": "..."}]}
+
+Use [] for any category with no items. Be conservative - do not invent.
 
 The note:
 ---
@@ -79,7 +98,7 @@ def extract(message_text):
     try:
         return json.loads(text.strip())
     except json.JSONDecodeError:
-        return {"people": [], "links": []}
+        return {"people": [], "links": [], "tasks": []}
 
 # --- State ---
 def load_state():
@@ -94,7 +113,7 @@ def save_state(state):
 
 # --- Main ---
 async def main():
-    people_sheet, links_sheet = get_sheets()
+    people_sheet, links_sheet, tasks_sheet = get_sheets()
     state = load_state()
     last_id = state.get("last_id", 0)
 
@@ -122,7 +141,7 @@ async def main():
                 if not name or name.lower() in existing_names:
                     continue
                 types_list = p.get("types", []) or []
-                types_str = ", ".join(t.strip().lower() for t in types_list if t.strip())
+                types_str = ", ".join(x.strip().lower() for x in types_list if x.strip())
                 people_sheet.append_row([name, p.get("context", ""), types_str, "", now, preview])
                 existing_names.add(name.lower())
                 print(f"  + Person: {name} [{types_str}]")
@@ -134,6 +153,14 @@ async def main():
                 links_sheet.append_row([url, link.get("title", ""), now, preview, "FALSE"])
                 existing_urls.add(url)
                 print(f"  + Link: {url}")
+
+            for t in result.get("tasks", []):
+                task_text = t.get("task", "").strip()
+                if not task_text:
+                    continue
+                due = t.get("due", "").strip()
+                tasks_sheet.append_row([task_text, now, due, "pending", preview])
+                print(f"  + Task: {task_text} (due: {due or 'none'})")
 
             state["last_id"] = max(state["last_id"], msg.id)
 
