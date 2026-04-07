@@ -1,7 +1,12 @@
 """
-Personal CRM Bot
+Personal CRM Bot (Telegram)
 Reads new messages from Telegram Saved Messages, extracts people, links,
-tasks, and ideas via Claude. Low-confidence items go to an Inbox tab.
+tasks, ideas, and venture deals via Claude. Low-confidence items go to
+Inbox tab for manual review.
+
+On Telegram, deals are captured freely whenever the user notes one - no
+filtering by source or direction. The user is logging deals they want to
+track; the bot's job is to structure them, not gatekeep.
 """
 import os
 import json
@@ -40,70 +45,72 @@ def get_sheets():
         "links": sh.worksheet("Links"),
         "tasks": sh.worksheet("Tasks"),
         "ideas": sh.worksheet("Ideas"),
+        "deals": sh.worksheet("Deals"),
         "inbox": sh.worksheet("Inbox"),
     }
 
 # --- Claude ---
 client_ai = Anthropic(api_key=ANTHROPIC_KEY)
 
-EXTRACTION_PROMPT = """You are parsing a personal note someone wrote to themselves. They use this notes channel for FOUR distinct purposes:
+EXTRACTION_PROMPT = """You are parsing a personal note the user wrote to themselves. The user is an investor. They use this notes channel for FIVE purposes:
 
-A) ADDING A PERSON to their CRM. Signals: "add X to people", "met X", introducing a new contact, describing who someone is or what they do. The note is ABOUT a person.
+A) ADDING A PERSON to their CRM. Signals: "add X to people", "met X", introducing a new contact.
 
-B) SAVING A LINK to read later. Signals: a URL is present, optionally with a few words of context.
+B) SAVING A LINK to read later.
 
-C) CAPTURING A TASK they need to do. Signals: imperative phrasing directed at themselves like "email X", "book Y", "remind me to Z", "need to ...", "follow up", "draft the memo".
+C) CAPTURING A TASK. Signals: "email X", "book Y", "remind me to Z", "need to", "follow up", "draft".
 
-D) CAPTURING AN IDEA - a speculative thought, hypothesis, observation, or musing they want to revisit later. Signals: "what if X", "idea: X", "could be cool to X", "interesting that X", "wonder whether X", "X might be a good business", or any reflective thought that isn't a task or a person description.
+D) CAPTURING AN IDEA - speculative thought, hypothesis, observation, musing. Signals: "what if", "idea:", "could be cool", "interesting that", "wonder whether".
 
-HARD TASK MARKERS: If the note contains any of: "todo:", "TODO:", "remind me to", "need to", "have to", "must", "don't forget to", "follow up" - it is a TASK, not an idea or person.
+E) CAPTURING A VENTURE DEAL they want to track. Any company raise, investment opportunity, secondary, acquisition, or similar. Capture freely - if the user is writing about a deal in any form, extract it. No filtering by who sourced it or direction.
 
-DISAMBIGUATION RULES:
-- A note that ADDS A PERSON should not also produce a task or idea, even if it describes the person's work. "Met Sarah, she's working on agentic AI" -> ONE person, ZERO ideas.
-- A note that captures a TASK should not also produce an idea about the task's subject. "Need to research agentic AI tools" -> ONE task, ZERO ideas.
-- An IDEA stands alone: it is not directed at anyone, is not an action item, and is not adding a contact. It is the writer thinking out loud.
-- If a note is clearly a musing AND mentions a person tangentially ("interesting how Sarah's approach to fundraising works - might be a model for us"), extract it as ONE idea, ZERO people.
+HARD TASK MARKERS: "todo:", "remind me to", "need to", "have to", "must", "don't forget to", "follow up" - these are tasks.
 
-Examples:
-- "Add Sarah Chen to people - partner at Sequoia" -> 1 person, 0 ideas, 0 tasks
-- "Email Sarah about the deck" -> 0 people, 1 task, 0 ideas
-- "What if we restructured the fund to allow for longer hold periods" -> 0 everything, 1 idea
-- "Interesting framing from Patrick OShaughnessys podcast - capital is patient when LPs are aligned" -> 0 people, 0 tasks, 1 idea
-- "Idea: a tool that auto-summarizes board decks" -> 1 idea
-- "Met Marcus, runs a family office. Could be a deal source. Also makes me think we should formalize our intro process." -> 1 person AND 1 idea (the formalization thought is separate from describing Marcus)
+DISAMBIGUATION:
+- A note that ADDS A PERSON should not also produce a task or idea.
+- A note that captures a TASK should not also produce an idea about the subject.
+- A DEAL and a PERSON can co-occur (e.g., "Sarah pitched Acme Series A, $15m" -> 1 person Sarah + 1 deal Acme).
+- An IDEA stands alone - not directed at anyone, not an action, not adding a contact.
+- A DEAL is distinct from an IDEA: a deal has a specific company name and at least some concrete terms or signals. A pure musing like "AI infra is hot right now" is an idea, not a deal.
 
-NAME FIDELITY: When extracting a person's name, copy it verbatim from the source. Never invent or substitute. If you cannot find an exact name, do not extract a person.
+NAME FIDELITY: Names must appear verbatim in the source. Never invent.
 
-CONFIDENCE: For each extracted item, include a confidence score 0.0-1.0:
-- 0.9-1.0: Clear and unambiguous
-- 0.7-0.89: Confident but some ambiguity
-- 0.5-0.69: Uncertain, route to Inbox for manual review
-- Below 0.5: Do not extract
+CONFIDENCE: 0.9-1.0 clear, 0.7-0.89 confident-with-ambiguity, 0.5-0.69 route to inbox, below 0.5 skip entirely.
 
 Extract:
 
-1. PEOPLE - real humans the note is ABOUT. Each: name (verbatim), context (one sentence), types (lowercase tags from: investor, vc, angel, deal source, entrepreneur, founder, family office, lp, operator, advisor, lawyer, banker, family, friend, journalist, recruiter; multiple allowed; empty if none), confidence.
+1. PEOPLE: name (verbatim), context (one sentence), types (lowercase from: investor, vc, angel, deal source, entrepreneur, founder, family office, lp, operator, advisor, lawyer, banker, family, friend, journalist, recruiter; multiple allowed; empty if none), confidence.
 
-2. LINKS - URLs in the note. Each: url, title (short guess), confidence.
+2. LINKS: url, title, confidence.
 
-3. TASKS - action items the writer needs to do. Each: task (rewrite as imperative), due (natural language date or empty), confidence.
+3. TASKS: task (imperative), due (natural language or empty), confidence.
 
-4. IDEAS - speculative thoughts, hypotheses, observations, or musings. Each: idea (rewrite as a clear statement, preserving the original thought), confidence.
+4. IDEAS: idea (clear statement), confidence.
+
+5. DEALS:
+   - company: company name (verbatim)
+   - terms: price, valuation, round size, share price (empty if not stated)
+   - direction: "looking" if someone is seeking this deal, "offering" if someone is pitching/selling it, "tracking" if the note is purely observational
+   - timeline: when it's happening in natural language (empty if not stated)
+   - deal_type: one of: seed, series_a, series_b, series_c, series_d, growth, secondary, bridge, safe, convertible, m_and_a, non_venture, unknown
+   - mentioned_by: the name of whoever brought the deal to the user, if the note says. If the user doesn't mention a source, use empty string.
+   - confidence: 0.0-1.0
 
 Return ONLY valid JSON, no prose:
-{"people": [{"name":"...","context":"...","types":["..."],"confidence":0.95}], "links": [{"url":"...","title":"...","confidence":0.99}], "tasks": [{"task":"...","due":"...","confidence":0.9}], "ideas": [{"idea":"...","confidence":0.85}]}
+{"people":[],"links":[],"tasks":[],"ideas":[],"deals":[]}
 
-Use [] for any category with no items. Be conservative - do not invent.
+Use [] for empty categories. Be conservative on everything except deals - for deals, if the note clearly mentions a company with any deal context, capture it.
 
 The note:
 ---
 %s
 ---"""
 
+
 def extract(message_text):
     resp = client_ai.messages.create(
         model="claude-opus-4-5",
-        max_tokens=1024,
+        max_tokens=1536,
         messages=[{"role": "user", "content": EXTRACTION_PROMPT % message_text}],
     )
     text = resp.content[0].text.strip()
@@ -115,7 +122,8 @@ def extract(message_text):
         return json.loads(text.strip())
     except json.JSONDecodeError:
         print(f"  ! JSON parse failed. Raw response: {text[:300]}")
-        return {"people": [], "links": [], "tasks": [], "ideas": []}
+        return {"people": [], "links": [], "tasks": [], "ideas": [], "deals": []}
+
 
 # --- State ---
 def load_state():
@@ -124,9 +132,11 @@ def load_state():
             return json.load(f)
     return {"last_id": 0}
 
+
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
+
 
 # --- Main ---
 async def main():
@@ -164,30 +174,28 @@ async def main():
                 if conf < CONFIDENCE_THRESHOLD:
                     sheets["inbox"].append_row([
                         "person", f"{name} - {context} [{types_str}]",
-                        f"Low confidence ({conf:.2f})", str(conf), preview, now, "pending"
+                        f"Low confidence ({conf:.2f})", f"{conf:.2f}", preview, now, "pending"
                     ])
-                    print(f"  ? Inbox (person): {name} [conf={conf:.2f}]")
+                    print(f"  ? Inbox person: {name} [conf={conf:.2f}]")
                 else:
                     sheets["people"].append_row([name, context, types_str, "", now, preview, "FALSE"])
                     existing_names.add(name.lower())
-                    print(f"  + Person: {name} [{types_str}] [conf={conf:.2f}]")
+                    print(f"  + Person: {name} [{types_str}]")
 
             for link in result.get("links", []):
                 url = link.get("url", "").strip()
                 if not url or url in existing_urls:
                     continue
                 conf = float(link.get("confidence", 1.0))
-                title = link.get("title", "")
                 if conf < CONFIDENCE_THRESHOLD:
                     sheets["inbox"].append_row([
-                        "link", f"{url} - {title}",
-                        f"Low confidence ({conf:.2f})", str(conf), preview, now, "pending"
+                        "link", f"{url} - {link.get('title','')}",
+                        f"Low confidence ({conf:.2f})", f"{conf:.2f}", preview, now, "pending"
                     ])
-                    print(f"  ? Inbox (link): {url} [conf={conf:.2f}]")
                 else:
-                    sheets["links"].append_row([url, title, now, preview, "FALSE"])
+                    sheets["links"].append_row([url, link.get("title", ""), now, preview, "FALSE"])
                     existing_urls.add(url)
-                    print(f"  + Link: {url} [conf={conf:.2f}]")
+                    print(f"  + Link: {url[:50]}")
 
             for t in result.get("tasks", []):
                 task_text = t.get("task", "").strip()
@@ -197,13 +205,12 @@ async def main():
                 due = t.get("due", "").strip()
                 if conf < CONFIDENCE_THRESHOLD:
                     sheets["inbox"].append_row([
-                        "task", f"{task_text}" + (f" (due {due})" if due else ""),
-                        f"Low confidence ({conf:.2f})", str(conf), preview, now, "pending"
+                        "task", task_text + (f" (due {due})" if due else ""),
+                        f"Low confidence ({conf:.2f})", f"{conf:.2f}", preview, now, "pending"
                     ])
-                    print(f"  ? Inbox (task): {task_text} [conf={conf:.2f}]")
                 else:
                     sheets["tasks"].append_row([task_text, now, due, "pending", preview])
-                    print(f"  + Task: {task_text} (due: {due or 'none'}) [conf={conf:.2f}]")
+                    print(f"  + Task: {task_text[:50]}")
 
             for idea in result.get("ideas", []):
                 idea_text = idea.get("idea", "").strip()
@@ -213,18 +220,41 @@ async def main():
                 if conf < CONFIDENCE_THRESHOLD:
                     sheets["inbox"].append_row([
                         "idea", idea_text,
-                        f"Low confidence ({conf:.2f})", str(conf), preview, now, "pending"
+                        f"Low confidence ({conf:.2f})", f"{conf:.2f}", preview, now, "pending"
                     ])
-                    print(f"  ? Inbox (idea): {idea_text[:60]} [conf={conf:.2f}]")
                 else:
-                    # Ideas: Idea | Created | Source Message | Sent in Digest
                     sheets["ideas"].append_row([idea_text, now, preview, "FALSE"])
-                    print(f"  + Idea: {idea_text[:60]} [conf={conf:.2f}]")
+                    print(f"  + Idea: {idea_text[:50]}")
+
+            for d in result.get("deals", []):
+                company = d.get("company", "").strip()
+                if not company:
+                    continue
+                conf = float(d.get("confidence", 1.0))
+                terms = d.get("terms", "")
+                direction = d.get("direction", "tracking")
+                timeline = d.get("timeline", "")
+                deal_type = d.get("deal_type", "unknown")
+                mentioned_by = d.get("mentioned_by", "")
+                if conf < CONFIDENCE_THRESHOLD:
+                    sheets["inbox"].append_row([
+                        "deal", f"{company} [{deal_type}] - {terms} ({direction})",
+                        f"Low confidence ({conf:.2f})", f"{conf:.2f}", preview, now, "pending"
+                    ])
+                    print(f"  ? Inbox deal: {company}")
+                else:
+                    # Deals: Company | Terms | Direction | Timeline | Deal Type | Mentioned By | Source | Captured At | Source Message | Sent in Digest
+                    sheets["deals"].append_row([
+                        company, terms, direction, timeline, deal_type,
+                        mentioned_by, "telegram", now, preview, "FALSE"
+                    ])
+                    print(f"  + Deal: {company} ({deal_type}, {direction})")
 
             state["last_id"] = max(state["last_id"], msg.id)
 
     save_state(state)
     print("Done.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
