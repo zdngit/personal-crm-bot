@@ -1,10 +1,10 @@
 """
 Morning Digest
-Sends a consolidated morning email with:
-- Links to read (unsent)
-- New people added since last morning digest
-- Upcoming reminders (next 7 days) - placeholder for future Reminders tab
-Marks links and people as sent after delivery.
+Consolidated morning email:
+- New people added since last digest
+- Reading list (unsent links)
+- New deals (from WhatsApp and Telegram)
+Marks links, people, and deals as sent after delivery.
 """
 import os
 import json
@@ -21,6 +21,7 @@ GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 RECIPIENT = os.environ["DIGEST_RECIPIENT"]
 
+
 def get_sheets():
     creds = Credentials.from_service_account_info(
         json.loads(SA_JSON),
@@ -31,10 +32,12 @@ def get_sheets():
     return {
         "people": sh.worksheet("People"),
         "links": sh.worksheet("Links"),
+        "deals": sh.worksheet("Deals"),
     }
 
+
 def collect_pending_links(sheet):
-    """Links columns: URL | Title | Captured At | Source Message | Sent in Digest"""
+    """Links: URL | Title | Captured At | Source Message | Sent in Digest"""
     rows = sheet.get_all_values()
     pending = []
     indices = []
@@ -44,8 +47,9 @@ def collect_pending_links(sheet):
             indices.append(i)
     return pending, indices
 
+
 def collect_new_people(sheet):
-    """People columns: Name | Context | Type | Notes | First Mentioned | Source Message | Sent in Digest"""
+    """People: Name | Context | Type | Notes | First Mentioned | Source Message | Sent in Digest"""
     rows = sheet.get_all_values()
     new_people = []
     indices = []
@@ -55,8 +59,45 @@ def collect_new_people(sheet):
             indices.append(i)
     return new_people, indices
 
-def build_html(today, links, people):
+
+def collect_new_deals(sheet):
+    """Deals: Company | Terms | Direction | Timeline | Deal Type | Mentioned By | Source | Captured At | Source Message | Sent in Digest"""
+    rows = sheet.get_all_values()
+    new_deals = []
+    indices = []
+    for i, row in enumerate(rows[1:], start=2):
+        if len(row) < 10 or row[9].strip().upper() != "TRUE":
+            new_deals.append(row)
+            indices.append(i)
+    return new_deals, indices
+
+
+def build_html(today, links, people, deals):
     sections = []
+
+    if deals:
+        # Group deals by source
+        wa_deals = [d for d in deals if len(d) > 6 and d[6].lower() == "whatsapp"]
+        tg_deals = [d for d in deals if len(d) > 6 and d[6].lower() == "telegram"]
+
+        deal_html_parts = []
+        if wa_deals:
+            deal_html_parts.append(f'<h4 style="margin:12px 0 6px 0;color:#555;">From WhatsApp ({len(wa_deals)})</h4>')
+            deal_html_parts.append("<ul style='padding-left:20px;'>")
+            for d in wa_deals:
+                deal_html_parts.append(_format_deal(d))
+            deal_html_parts.append("</ul>")
+        if tg_deals:
+            deal_html_parts.append(f'<h4 style="margin:12px 0 6px 0;color:#555;">From Telegram notes ({len(tg_deals)})</h4>')
+            deal_html_parts.append("<ul style='padding-left:20px;'>")
+            for d in tg_deals:
+                deal_html_parts.append(_format_deal(d))
+            deal_html_parts.append("</ul>")
+
+        sections.append(f"""
+        <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;">Deals ({len(deals)})</h3>
+        {''.join(deal_html_parts)}
+        """)
 
     if people:
         people_html = "\n".join(
@@ -83,11 +124,6 @@ def build_html(today, links, people):
         <ul style="padding-left:20px;">{links_html}</ul>
         """)
 
-    sections.append("""
-    <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;color:#999;">Reminders</h3>
-    <p style="color:#999;font-size:13px;">No reminders set up yet. Add a Reminders tab when ready.</p>
-    """)
-
     body = "\n".join(sections) if sections else "<p>Nothing new this morning.</p>"
 
     return f"""
@@ -98,8 +134,55 @@ def build_html(today, links, people):
     </body></html>
     """
 
-def build_text(today, links, people):
+
+def _format_deal(d):
+    """Format a single deal row as an <li>."""
+    # Columns: Company | Terms | Direction | Timeline | Deal Type | Mentioned By | Source | Captured | Source Message | Sent
+    company = d[0] if len(d) > 0 else ""
+    terms = d[1] if len(d) > 1 else ""
+    direction = d[2] if len(d) > 2 else ""
+    timeline = d[3] if len(d) > 3 else ""
+    deal_type = d[4] if len(d) > 4 else ""
+    mentioned_by = d[5] if len(d) > 5 else ""
+
+    parts = [f'<strong>{company}</strong>']
+    meta = []
+    if deal_type and deal_type != "unknown":
+        meta.append(deal_type)
+    if direction:
+        meta.append(direction)
+    if meta:
+        parts.append(f' <span style="color:#666;font-size:12px;">[{", ".join(meta)}]</span>')
+
+    details = []
+    if terms:
+        details.append(terms)
+    if timeline:
+        details.append(f"timeline: {timeline}")
+    if mentioned_by:
+        details.append(f"via {mentioned_by}")
+    if details:
+        parts.append(f'<br><span style="color:#444;font-size:13px;">{" &middot; ".join(details)}</span>')
+
+    return f'<li style="margin-bottom:8px;">{"".join(parts)}</li>'
+
+
+def build_text(today, links, people, deals):
     parts = [f"Morning brief - {today}\n"]
+    if deals:
+        parts.append(f"DEALS ({len(deals)}):")
+        for d in deals:
+            line = f"- {d[0]}"
+            if len(d) > 4 and d[4] and d[4] != "unknown":
+                line += f" [{d[4]}]"
+            if len(d) > 1 and d[1]:
+                line += f" - {d[1]}"
+            if len(d) > 5 and d[5]:
+                line += f" via {d[5]}"
+            if len(d) > 6 and d[6]:
+                line += f" ({d[6]})"
+            parts.append(line)
+        parts.append("")
     if people:
         parts.append(f"NEW PEOPLE ({len(people)}):")
         for p in people:
@@ -115,24 +198,26 @@ def build_text(today, links, people):
         for r in links:
             parts.append(f"- {r[1] or 'Link'}: {r[0]}")
         parts.append("")
-    if not people and not links:
+    if not people and not links and not deals:
         parts.append("Nothing new this morning.")
     return "\n".join(parts)
+
 
 def main():
     sheets = get_sheets()
     links, link_indices = collect_pending_links(sheets["links"])
     people, people_indices = collect_new_people(sheets["people"])
+    deals, deal_indices = collect_new_deals(sheets["deals"])
 
-    if not links and not people:
+    if not links and not people and not deals:
         print("Nothing to send.")
         return
 
     today = datetime.now().strftime("%A, %B %d")
-    html = build_html(today, links, people)
-    text = build_text(today, links, people)
+    html = build_html(today, links, people, deals)
+    text = build_text(today, links, people, deals)
 
-    total = len(links) + len(people)
+    total = len(links) + len(people) + len(deals)
     msg = EmailMessage()
     msg["Subject"] = f"Morning brief - {today} ({total} item{'s' if total != 1 else ''})"
     msg["From"] = GMAIL_ADDRESS
@@ -143,14 +228,17 @@ def main():
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
         smtp.send_message(msg)
-    print(f"Sent morning digest: {len(people)} people, {len(links)} links.")
+    print(f"Sent morning digest: {len(deals)} deals, {len(people)} people, {len(links)} links.")
 
     # Mark as sent
     for i in link_indices:
         sheets["links"].update_cell(i, 5, "TRUE")
     for i in people_indices:
         sheets["people"].update_cell(i, 7, "TRUE")
+    for i in deal_indices:
+        sheets["deals"].update_cell(i, 10, "TRUE")
     print("Marked rows as sent.")
+
 
 if __name__ == "__main__":
     main()
