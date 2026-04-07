@@ -1,14 +1,15 @@
 """
 Morning Digest
-Consolidated morning email:
-- New deals (WhatsApp and Telegram, grouped by source)
-- New people added since last digest
-- Reading list with 2-3 sentence summaries of each link
+Consolidated morning email with hybrid table layout:
+- Deals (Company | Type | Terms | Mentioned By columns, sub-line for timeline/direction)
+- New people (Name | Type columns, sub-line for context)
+- Reading list (Title column linked to URL, sub-line for summary)
 Uses batched sheet updates.
 """
 import os
 import json
 import smtplib
+import html as htmllib
 from email.message import EmailMessage
 from datetime import datetime
 
@@ -82,98 +83,177 @@ def batch_mark_sent(sheet, row_indices, col_letter):
     sheet.batch_update(updates, value_input_option="USER_ENTERED")
 
 
-def build_html(today, links, people, deals):
-    sections = []
+# --- HTML building blocks ---
 
-    if deals:
-        wa_deals = [d for d in deals if len(d) > 6 and d[6].lower() == "whatsapp"]
-        tg_deals = [d for d in deals if len(d) > 6 and d[6].lower() == "telegram"]
+# Styles used across all tables for consistency
+TABLE_STYLE = (
+    "width:100%;border-collapse:collapse;margin:8px 0 20px 0;"
+    "font-size:13px;"
+)
+TH_STYLE = (
+    "text-align:left;padding:8px 10px;background:#f5f7fa;"
+    "color:#555;font-weight:600;font-size:11px;text-transform:uppercase;"
+    "letter-spacing:0.5px;border-bottom:1px solid #e0e4ea;"
+)
+TD_STYLE = (
+    "padding:10px;border-bottom:1px solid #f0f0f0;vertical-align:top;"
+)
+SUBLINE_STYLE = (
+    "color:#888;font-size:12px;margin-top:3px;display:block;"
+)
 
-        deal_html_parts = []
-        if wa_deals:
-            deal_html_parts.append(f'<h4 style="margin:12px 0 6px 0;color:#555;">From WhatsApp ({len(wa_deals)})</h4>')
-            deal_html_parts.append("<ul style='padding-left:20px;'>")
-            for d in wa_deals:
-                deal_html_parts.append(_format_deal(d))
-            deal_html_parts.append("</ul>")
-        if tg_deals:
-            deal_html_parts.append(f'<h4 style="margin:12px 0 6px 0;color:#555;">From Telegram notes ({len(tg_deals)})</h4>')
-            deal_html_parts.append("<ul style='padding-left:20px;'>")
-            for d in tg_deals:
-                deal_html_parts.append(_format_deal(d))
-            deal_html_parts.append("</ul>")
 
-        sections.append(f"""
-        <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;">Deals ({len(deals)})</h3>
-        {''.join(deal_html_parts)}
-        """)
+def esc(s):
+    """HTML-escape a value, returning empty string for None."""
+    if s is None:
+        return ""
+    return htmllib.escape(str(s))
 
-    if people:
-        people_html = "\n".join(
-            f'<li><strong>{p[0]}</strong>'
-            + (f' <span style="color:#666;font-size:12px;">[{p[2]}]</span>' if len(p) > 2 and p[2] else '')
-            + (f'<br><span style="color:#444;font-size:13px;">{p[1]}</span>' if len(p) > 1 and p[1] else '')
-            + '</li>'
-            for p in people
-        )
-        sections.append(f"""
-        <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;">New people ({len(people)})</h3>
-        <ul style="padding-left:20px;">{people_html}</ul>
-        """)
 
-    if links:
-        # Links: URL | Title | Summary | Captured At | Source Message | Sent in Digest
-        links_html = "\n".join(
-            f'<li style="margin-bottom:12px;">'
-            f'<a href="{r[0]}" style="color:#0066cc;font-weight:500;">{r[1] or r[0]}</a>'
-            + (f'<br><span style="color:#333;font-size:13px;">{r[2]}</span>' if len(r) > 2 and r[2] else '')
-            + '</li>'
-            for r in links
-        )
-        sections.append(f"""
-        <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;">Reading list ({len(links)})</h3>
-        <ul style="padding-left:20px;">{links_html}</ul>
-        """)
+def build_deals_table(deals):
+    """
+    Deals columns shown: Company | Type | Terms | Mentioned By
+    Sub-line per row: direction + timeline + source
+    """
+    if not deals:
+        return ""
 
-    body = "\n".join(sections) if sections else "<p>Nothing new this morning.</p>"
+    rows_html = []
+    for d in deals:
+        # Deals cols: Company | Terms | Direction | Timeline | Deal Type | Mentioned By | Source | Captured | Source Message | Sent
+        company = d[0] if len(d) > 0 else ""
+        terms = d[1] if len(d) > 1 else ""
+        direction = d[2] if len(d) > 2 else ""
+        timeline = d[3] if len(d) > 3 else ""
+        deal_type = d[4] if len(d) > 4 else ""
+        mentioned_by = d[5] if len(d) > 5 else ""
+        source = d[6] if len(d) > 6 else ""
+
+        subline_parts = []
+        if direction:
+            subline_parts.append(esc(direction))
+        if timeline:
+            subline_parts.append(f"timeline: {esc(timeline)}")
+        if source:
+            subline_parts.append(f"via {esc(source)}")
+        subline = " &middot; ".join(subline_parts)
+
+        dt_display = deal_type if deal_type and deal_type != "unknown" else "-"
+
+        rows_html.append(f"""
+        <tr>
+          <td style="{TD_STYLE}font-weight:600;color:#111;">{esc(company)}</td>
+          <td style="{TD_STYLE}color:#555;">{esc(dt_display)}</td>
+          <td style="{TD_STYLE}color:#333;">{esc(terms) or "-"}</td>
+          <td style="{TD_STYLE}color:#555;">{esc(mentioned_by) or "-"}
+            {f'<span style="{SUBLINE_STYLE}">{subline}</span>' if subline else ''}
+          </td>
+        </tr>""")
 
     return f"""
-    <html><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:640px;margin:auto;color:#222;">
-    <h2 style="color:#111;">Morning brief - {today}</h2>
-    {body}
-    <p style="color:#999;font-size:11px;margin-top:30px;">Sent by your personal CRM bot.</p>
-    </body></html>
+    <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;margin-top:24px;">Deals ({len(deals)})</h3>
+    <table style="{TABLE_STYLE}">
+      <thead>
+        <tr>
+          <th style="{TH_STYLE}">Company</th>
+          <th style="{TH_STYLE}">Type</th>
+          <th style="{TH_STYLE}">Terms</th>
+          <th style="{TH_STYLE}">Source</th>
+        </tr>
+      </thead>
+      <tbody>{''.join(rows_html)}</tbody>
+    </table>
     """
 
 
-def _format_deal(d):
-    company = d[0] if len(d) > 0 else ""
-    terms = d[1] if len(d) > 1 else ""
-    direction = d[2] if len(d) > 2 else ""
-    timeline = d[3] if len(d) > 3 else ""
-    deal_type = d[4] if len(d) > 4 else ""
-    mentioned_by = d[5] if len(d) > 5 else ""
+def build_people_table(people):
+    """
+    People columns shown: Name | Type
+    Sub-line per row: context
+    """
+    if not people:
+        return ""
 
-    parts = [f'<strong>{company}</strong>']
-    meta = []
-    if deal_type and deal_type != "unknown":
-        meta.append(deal_type)
-    if direction:
-        meta.append(direction)
-    if meta:
-        parts.append(f' <span style="color:#666;font-size:12px;">[{", ".join(meta)}]</span>')
+    rows_html = []
+    for p in people:
+        # People cols: Name | Context | Type | Notes | First Mentioned | Source Message | Sent
+        name = p[0] if len(p) > 0 else ""
+        context = p[1] if len(p) > 1 else ""
+        ptype = p[2] if len(p) > 2 else ""
 
-    details = []
-    if terms:
-        details.append(terms)
-    if timeline:
-        details.append(f"timeline: {timeline}")
-    if mentioned_by:
-        details.append(f"via {mentioned_by}")
-    if details:
-        parts.append(f'<br><span style="color:#444;font-size:13px;">{" &middot; ".join(details)}</span>')
+        rows_html.append(f"""
+        <tr>
+          <td style="{TD_STYLE}font-weight:600;color:#111;width:30%;">{esc(name)}</td>
+          <td style="{TD_STYLE}color:#555;">{esc(ptype) or "-"}
+            {f'<span style="{SUBLINE_STYLE}">{esc(context)}</span>' if context else ''}
+          </td>
+        </tr>""")
 
-    return f'<li style="margin-bottom:8px;">{"".join(parts)}</li>'
+    return f"""
+    <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;margin-top:24px;">New people ({len(people)})</h3>
+    <table style="{TABLE_STYLE}">
+      <thead>
+        <tr>
+          <th style="{TH_STYLE}">Name</th>
+          <th style="{TH_STYLE}">Type &amp; context</th>
+        </tr>
+      </thead>
+      <tbody>{''.join(rows_html)}</tbody>
+    </table>
+    """
+
+
+def build_links_table(links):
+    """
+    Links columns shown: Title (linked)
+    Sub-line per row: summary
+    Single column because links work best with full-width titles.
+    """
+    if not links:
+        return ""
+
+    rows_html = []
+    for r in links:
+        # Links cols: URL | Title | Summary | Captured At | Source Message | Sent
+        url = r[0] if len(r) > 0 else ""
+        title = r[1] if len(r) > 1 else ""
+        summary = r[2] if len(r) > 2 else ""
+
+        display_title = title if title else url
+
+        rows_html.append(f"""
+        <tr>
+          <td style="{TD_STYLE}">
+            <a href="{esc(url)}" style="color:#0066cc;font-weight:500;text-decoration:none;">{esc(display_title)}</a>
+            {f'<span style="{SUBLINE_STYLE}">{esc(summary)}</span>' if summary else ''}
+          </td>
+        </tr>""")
+
+    return f"""
+    <h3 style="border-bottom:1px solid #eee;padding-bottom:6px;margin-top:24px;">Reading list ({len(links)})</h3>
+    <table style="{TABLE_STYLE}">
+      <tbody>{''.join(rows_html)}</tbody>
+    </table>
+    """
+
+
+def build_html(today, links, people, deals):
+    sections = []
+    if deals:
+        sections.append(build_deals_table(deals))
+    if people:
+        sections.append(build_people_table(people))
+    if links:
+        sections.append(build_links_table(links))
+
+    body = "\n".join(sections) if sections else '<p style="color:#999;">Nothing new this morning.</p>'
+
+    return f"""<html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:720px;margin:auto;color:#222;padding:20px;">
+    <h2 style="color:#111;margin-bottom:8px;">Morning brief</h2>
+    <p style="color:#888;font-size:13px;margin-top:0;">{today}</p>
+    {body}
+    <p style="color:#999;font-size:11px;margin-top:40px;border-top:1px solid #eee;padding-top:12px;">Sent by your personal CRM bot.</p>
+    </body></html>"""
 
 
 def build_text(today, links, people, deals):
@@ -242,7 +322,7 @@ def main():
     print(f"Sent morning digest: {len(deals)} deals, {len(people)} people, {len(links)} links.")
 
     print("Marking rows as sent...")
-    batch_mark_sent(sheets["links"], link_indices, "F")       # Links col 6 = F (Sent in Digest)
+    batch_mark_sent(sheets["links"], link_indices, "F")       # Links col 6 = F
     batch_mark_sent(sheets["people"], people_indices, "G")    # People col 7 = G
     batch_mark_sent(sheets["deals"], deal_indices, "J")       # Deals col 10 = J
     print("Done.")
