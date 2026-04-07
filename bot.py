@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import PeerUser
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -25,7 +24,7 @@ SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 SA_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 
-STATE_FILE = "state.json"  # Tracks last processed message ID
+STATE_FILE = "state.json"
 
 # --- Google Sheets setup ---
 def get_sheets():
@@ -59,22 +58,20 @@ EXTRACTION_PROMPT = """You are parsing a personal note someone wrote to themselv
 Return ONLY valid JSON in this exact shape, no prose:
 {"people": [{"name": "...", "context": "...", "types": ["...", "..."]}], "links": [{"url": "...", "title": "..."}]}
 
-If there are no people, use []. Same for links. Be conservative — don't invent people who
-aren't clearly named, and don't guess types you have no evidence for.
+If there are no people, use []. Same for links. Be conservative.
 
 The note:
 ---
 %s
 ---"""
 
-def extract(message_text: str) -> dict:
+def extract(message_text):
     resp = client_ai.messages.create(
         model="claude-opus-4-5",
         max_tokens=1024,
         messages=[{"role": "user", "content": EXTRACTION_PROMPT % message_text}],
     )
     text = resp.content[0].text.strip()
-    # Strip code fences if Claude added them
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
@@ -84,7 +81,7 @@ def extract(message_text: str) -> dict:
     except json.JSONDecodeError:
         return {"people": [], "links": []}
 
-# --- State (last seen message ID) ---
+# --- State ---
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
@@ -108,10 +105,9 @@ async def main():
             if msg.text:
                 new_messages.append(msg)
 
-        new_messages.reverse()  # Process oldest first
+        new_messages.reverse()
         print(f"Found {len(new_messages)} new messages")
 
-        # Dedupe people and links by checking what's already in the sheets
         existing_names = {row[0].strip().lower() for row in people_sheet.get_all_values()[1:] if row}
         existing_urls = {row[0].strip() for row in links_sheet.get_all_values()[1:] if row}
 
@@ -127,16 +123,15 @@ async def main():
                     continue
                 types_list = p.get("types", []) or []
                 types_str = ", ".join(t.strip().lower() for t in types_list if t.strip())
-                # Columns: Name | Context | Type | Notes | First Mentioned | Source Message
                 people_sheet.append_row([name, p.get("context", ""), types_str, "", now, preview])
                 existing_names.add(name.lower())
                 print(f"  + Person: {name} [{types_str}]")
 
-            for l in result.get("links", []):
-                url = l.get("url", "").strip()
+            for link in result.get("links", []):
+                url = link.get("url", "").strip()
                 if not url or url in existing_urls:
                     continue
-                links_sheet.append_row([url, l.get("title", ""), now, preview, "FALSE"])
+                links_sheet.append_row([url, link.get("title", ""), now, preview, "FALSE"])
                 existing_urls.add(url)
                 print(f"  + Link: {url}")
 
