@@ -2,13 +2,14 @@ name: Personal CRM Bot
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # Every 30 minutes — pull new messages
-    - cron: "0 7 * * *"      # 7:00 UTC daily — send digest (adjust for your timezone)
-  workflow_dispatch:          # Lets you trigger it manually from the Actions tab
+    - cron: "*/30 * * * *"   # Every 30 min - pull new messages
+    - cron: "0 7 * * *"      # 07:00 UTC - morning links digest (08:00 London BST / 07:00 GMT)
+    - cron: "0 17 * * *"     # 17:00 UTC - evening tasks digest (18:00 London BST / 17:00 GMT)
+  workflow_dispatch:
 
 jobs:
   ingest:
-    if: github.event.schedule != '0 7 * * *'
+    if: github.event.schedule != '0 7 * * *' && github.event.schedule != '0 17 * * *'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,8 +32,8 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
-  digest:
-    if: github.event.schedule == '0 7 * * *' || github.event_name == 'workflow_dispatch'
+  links_digest:
+    if: github.event.schedule == '0 7 * * *'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +42,23 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements.txt
       - run: python digest.py
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          DIGEST_RECIPIENT: ${{ secrets.DIGEST_RECIPIENT }}
+
+  tasks_digest:
+    if: github.event.schedule == '0 17 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python tasks_digest.py
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
