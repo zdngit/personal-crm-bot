@@ -1,17 +1,16 @@
 """
 Personal CRM Bot (Telegram)
 Reads new messages from Telegram Saved Messages, extracts people, links,
-tasks, ideas, and venture deals via Claude. Low-confidence items go to
-Inbox tab for manual review.
-
-On Telegram, deals are captured freely whenever the user notes one - no
-filtering by source or direction. The user is logging deals they want to
-track; the bot's job is to structure them, not gatekeep.
+tasks, ideas, and venture deals via Claude. Links get fetched and summarized
+automatically so the sheet always shows a 2-3 sentence summary.
 """
 import os
+import re
 import json
 import asyncio
 from datetime import datetime, timezone
+
+import httpx
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -31,6 +30,8 @@ ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 STATE_FILE = "state.json"
 CONFIDENCE_THRESHOLD = 0.7
+FETCH_TIMEOUT = 15  # seconds
+FETCH_MAX_CHARS = 20000  # Cap page content sent to Claude
 
 # --- Sheets ---
 def get_sheets():
@@ -62,7 +63,7 @@ C) CAPTURING A TASK. Signals: "email X", "book Y", "remind me to Z", "need to", 
 
 D) CAPTURING AN IDEA - speculative thought, hypothesis, observation, musing. Signals: "what if", "idea:", "could be cool", "interesting that", "wonder whether".
 
-E) CAPTURING A VENTURE DEAL they want to track. Any company raise, investment opportunity, secondary, acquisition, or similar. Capture freely - if the user is writing about a deal in any form, extract it. No filtering by who sourced it or direction.
+E) CAPTURING A VENTURE DEAL they want to track. Any company raise, investment opportunity, secondary, acquisition. Capture freely - if the user is writing about a deal in any form, extract it. No filtering by source or direction.
 
 HARD TASK MARKERS: "todo:", "remind me to", "need to", "have to", "must", "don't forget to", "follow up" - these are tasks.
 
@@ -71,40 +72,48 @@ DISAMBIGUATION:
 - A note that captures a TASK should not also produce an idea about the subject.
 - A DEAL and a PERSON can co-occur (e.g., "Sarah pitched Acme Series A, $15m" -> 1 person Sarah + 1 deal Acme).
 - An IDEA stands alone - not directed at anyone, not an action, not adding a contact.
-- A DEAL is distinct from an IDEA: a deal has a specific company name and at least some concrete terms or signals. A pure musing like "AI infra is hot right now" is an idea, not a deal.
+- A DEAL has a specific company and concrete signals. A pure musing like "AI infra is hot" is an idea, not a deal.
 
 NAME FIDELITY: Names must appear verbatim in the source. Never invent.
 
-CONFIDENCE: 0.9-1.0 clear, 0.7-0.89 confident-with-ambiguity, 0.5-0.69 route to inbox, below 0.5 skip entirely.
+CONFIDENCE: 0.9-1.0 clear, 0.7-0.89 confident-with-ambiguity, 0.5-0.69 route to inbox, below 0.5 skip.
 
 Extract:
 
-1. PEOPLE: name (verbatim), context (one sentence), types (lowercase from: investor, vc, angel, deal source, entrepreneur, founder, family office, lp, operator, advisor, lawyer, banker, family, friend, journalist, recruiter; multiple allowed; empty if none), confidence.
+1. PEOPLE: name (verbatim), context, types (lowercase from: investor, vc, angel, deal source, entrepreneur, founder, family office, lp, operator, advisor, lawyer, banker, family, friend, journalist, recruiter), confidence.
 
 2. LINKS: url, title, confidence.
 
-3. TASKS: task (imperative), due (natural language or empty), confidence.
+3. TASKS: task (imperative), due, confidence.
 
 4. IDEAS: idea (clear statement), confidence.
 
-5. DEALS:
-   - company: company name (verbatim)
-   - terms: price, valuation, round size, share price (empty if not stated)
-   - direction: "looking" if someone is seeking this deal, "offering" if someone is pitching/selling it, "tracking" if the note is purely observational
-   - timeline: when it's happening in natural language (empty if not stated)
-   - deal_type: one of: seed, series_a, series_b, series_c, series_d, growth, secondary, bridge, safe, convertible, m_and_a, non_venture, unknown
-   - mentioned_by: the name of whoever brought the deal to the user, if the note says. If the user doesn't mention a source, use empty string.
-   - confidence: 0.0-1.0
+5. DEALS: company, terms, direction ("looking"/"offering"/"tracking"), timeline, deal_type (seed/series_a/series_b/series_c/series_d/growth/secondary/bridge/safe/convertible/m_and_a/non_venture/unknown), mentioned_by (or empty), confidence.
 
 Return ONLY valid JSON, no prose:
 {"people":[],"links":[],"tasks":[],"ideas":[],"deals":[]}
 
-Use [] for empty categories. Be conservative on everything except deals - for deals, if the note clearly mentions a company with any deal context, capture it.
+Be conservative.
 
 The note:
 ---
 %s
 ---"""
+
+
+SUMMARY_PROMPT = """You will be given the text content of a web page. Write a 2-3 sentence summary that tells the reader what the article/post/page is about and the key point or takeaway. Be concrete. Don't use phrases like "this article discusses" - just state the substance directly.
+
+If the page content is unreadable, a login wall, an error page, or doesn't contain an actual article, respond with exactly: UNREADABLE
+
+Page URL: %s
+Page title: %s
+
+Page content:
+---
+%s
+---
+
+Summary:"""
 
 
 def extract(message_text):
@@ -123,6 +132,80 @@ def extract(message_text):
     except json.JSONDecodeError:
         print(f"  ! JSON parse failed. Raw response: {text[:300]}")
         return {"people": [], "links": [], "tasks": [], "ideas": [], "deals": []}
+
+
+def fetch_page(url):
+    """Fetch a page and return (title, cleaned_text). Returns (None, None) on failure."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        with httpx.Client(
+            follow_redirects=True,
+            timeout=FETCH_TIMEOUT,
+            headers=headers,
+        ) as client:
+            resp = client.get(url)
+            if resp.status_code >= 400:
+                return None, None
+            html = resp.text
+    except Exception as e:
+        print(f"    fetch error: {e}")
+        return None, None
+
+    # Extract title
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    title = title_match.group(1).strip() if title_match else ""
+    title = re.sub(r"\s+", " ", title)[:200]
+
+    # Strip script and style blocks
+    html = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+    html = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+
+    # Strip all other HTML tags
+    text = re.sub(r"<[^>]+>", " ", html)
+
+    # Decode common HTML entities
+    replacements = {
+        "&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">",
+        "&quot;": '"', "&#39;": "'", "&apos;": "'",
+    }
+    for entity, char in replacements.items():
+        text = text.replace(entity, char)
+
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if len(text) < 100:
+        return title, None
+
+    return title, text[:FETCH_MAX_CHARS]
+
+
+def summarize_link(url, claude_title):
+    """Fetch page and generate a 2-3 sentence summary."""
+    print(f"    fetching: {url[:80]}")
+    page_title, content = fetch_page(url)
+    if not content:
+        return "Unable to fetch page for summary."
+
+    try:
+        resp = client_ai.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=256,
+            messages=[{
+                "role": "user",
+                "content": SUMMARY_PROMPT % (url, page_title or claude_title or "", content),
+            }],
+        )
+        summary = resp.content[0].text.strip()
+        if summary == "UNREADABLE" or not summary:
+            return "Page content not readable."
+        return summary
+    except Exception as e:
+        print(f"    summary error: {e}")
+        return "Summary generation failed."
 
 
 # --- State ---
@@ -187,15 +270,18 @@ async def main():
                 if not url or url in existing_urls:
                     continue
                 conf = float(link.get("confidence", 1.0))
+                title = link.get("title", "")
                 if conf < CONFIDENCE_THRESHOLD:
                     sheets["inbox"].append_row([
-                        "link", f"{url} - {link.get('title','')}",
+                        "link", f"{url} - {title}",
                         f"Low confidence ({conf:.2f})", f"{conf:.2f}", preview, now, "pending"
                     ])
                 else:
-                    sheets["links"].append_row([url, link.get("title", ""), now, preview, "FALSE"])
+                    summary = summarize_link(url, title)
+                    # Links: URL | Title | Summary | Captured At | Source Message | Sent in Digest
+                    sheets["links"].append_row([url, title, summary, now, preview, "FALSE"])
                     existing_urls.add(url)
-                    print(f"  + Link: {url[:50]}")
+                    print(f"  + Link: {url[:50]} -> {summary[:60]}")
 
             for t in result.get("tasks", []):
                 task_text = t.get("task", "").strip()
@@ -243,7 +329,6 @@ async def main():
                     ])
                     print(f"  ? Inbox deal: {company}")
                 else:
-                    # Deals: Company | Terms | Direction | Timeline | Deal Type | Mentioned By | Source | Captured At | Source Message | Sent in Digest
                     sheets["deals"].append_row([
                         company, terms, direction, timeline, deal_type,
                         mentioned_by, "telegram", now, preview, "FALSE"
