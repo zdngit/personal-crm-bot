@@ -1,8 +1,7 @@
 """
 Personal CRM Bot (Telegram)
-Reads new messages from Telegram Saved Messages, extracts people, links,
-tasks, ideas, and venture deals via Claude. Links get fetched and summarized
-automatically so the sheet always shows a 2-3 sentence summary.
+Extracts people, links, tasks, ideas, deals. Summarizes links.
+Logs every Claude API call to the Costs tab.
 """
 import os
 import re
@@ -20,6 +19,8 @@ from google.oauth2.service_account import Credentials
 
 from anthropic import Anthropic
 
+from cost_tracker import log_cost
+
 # --- Config ---
 API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
@@ -30,8 +31,9 @@ ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 STATE_FILE = "state.json"
 CONFIDENCE_THRESHOLD = 0.7
-FETCH_TIMEOUT = 15  # seconds
-FETCH_MAX_CHARS = 20000  # Cap page content sent to Claude
+FETCH_TIMEOUT = 15
+FETCH_MAX_CHARS = 20000
+MODEL = "claude-opus-4-5"
 
 # --- Sheets ---
 def get_sheets():
@@ -48,6 +50,7 @@ def get_sheets():
         "ideas": sh.worksheet("Ideas"),
         "deals": sh.worksheet("Deals"),
         "inbox": sh.worksheet("Inbox"),
+        "costs": sh.worksheet("Costs"),
     }
 
 # --- Claude ---
@@ -63,37 +66,29 @@ C) CAPTURING A TASK. Signals: "email X", "book Y", "remind me to Z", "need to", 
 
 D) CAPTURING AN IDEA - speculative thought, hypothesis, observation, musing. Signals: "what if", "idea:", "could be cool", "interesting that", "wonder whether".
 
-E) CAPTURING A VENTURE DEAL they want to track. Any company raise, investment opportunity, secondary, acquisition. Capture freely - if the user is writing about a deal in any form, extract it. No filtering by source or direction.
+E) CAPTURING A VENTURE DEAL. Any company raise, investment opportunity, secondary, acquisition.
 
 HARD TASK MARKERS: "todo:", "remind me to", "need to", "have to", "must", "don't forget to", "follow up" - these are tasks.
 
 DISAMBIGUATION:
 - A note that ADDS A PERSON should not also produce a task or idea.
-- A note that captures a TASK should not also produce an idea about the subject.
-- A DEAL and a PERSON can co-occur (e.g., "Sarah pitched Acme Series A, $15m" -> 1 person Sarah + 1 deal Acme).
-- An IDEA stands alone - not directed at anyone, not an action, not adding a contact.
-- A DEAL has a specific company and concrete signals. A pure musing like "AI infra is hot" is an idea, not a deal.
+- A DEAL and a PERSON can co-occur (e.g., "Sarah pitched Acme Series A" -> 1 person + 1 deal).
+- An IDEA stands alone - not directed at anyone.
+- A DEAL has a specific company and concrete signals.
 
-NAME FIDELITY: Names must appear verbatim in the source. Never invent.
+NAME FIDELITY: Names must appear verbatim. Never invent.
 
-CONFIDENCE: 0.9-1.0 clear, 0.7-0.89 confident-with-ambiguity, 0.5-0.69 route to inbox, below 0.5 skip.
+CONFIDENCE: 0.9-1.0 clear, 0.7-0.89 confident, 0.5-0.69 route to inbox, below 0.5 skip.
 
 Extract:
-
-1. PEOPLE: name (verbatim), context, types (lowercase from: investor, vc, angel, deal source, entrepreneur, founder, family office, lp, operator, advisor, lawyer, banker, family, friend, journalist, recruiter), confidence.
-
+1. PEOPLE: name, context, types (from: investor, vc, angel, deal source, entrepreneur, founder, family office, lp, operator, advisor, lawyer, banker, family, friend, journalist, recruiter), confidence.
 2. LINKS: url, title, confidence.
+3. TASKS: task, due, confidence.
+4. IDEAS: idea, confidence.
+5. DEALS: company, terms, direction (looking/offering/tracking), timeline, deal_type (seed/series_a/series_b/series_c/series_d/growth/secondary/bridge/safe/convertible/m_and_a/non_venture/unknown), mentioned_by, confidence.
 
-3. TASKS: task (imperative), due, confidence.
-
-4. IDEAS: idea (clear statement), confidence.
-
-5. DEALS: company, terms, direction ("looking"/"offering"/"tracking"), timeline, deal_type (seed/series_a/series_b/series_c/series_d/growth/secondary/bridge/safe/convertible/m_and_a/non_venture/unknown), mentioned_by (or empty), confidence.
-
-Return ONLY valid JSON, no prose:
+Return ONLY valid JSON:
 {"people":[],"links":[],"tasks":[],"ideas":[],"deals":[]}
-
-Be conservative.
 
 The note:
 ---
@@ -101,14 +96,14 @@ The note:
 ---"""
 
 
-SUMMARY_PROMPT = """You will be given the text content of a web page. Write a 2-3 sentence summary that tells the reader what the article/post/page is about and the key point or takeaway. Be concrete. Don't use phrases like "this article discusses" - just state the substance directly.
+SUMMARY_PROMPT = """You will be given the text content of a web page. Write a 2-3 sentence summary of what the article/post is about and the key takeaway. Be concrete. Don't use phrases like "this article discusses" - just state the substance.
 
-If the page content is unreadable, a login wall, an error page, or doesn't contain an actual article, respond with exactly: UNREADABLE
+If unreadable/login wall/error, respond with exactly: UNREADABLE
 
 Page URL: %s
 Page title: %s
 
-Page content:
+Content:
 ---
 %s
 ---
@@ -116,12 +111,14 @@ Page content:
 Summary:"""
 
 
-def extract(message_text):
+def extract(message_text, costs_sheet):
     resp = client_ai.messages.create(
-        model="claude-opus-4-5",
+        model=MODEL,
         max_tokens=1536,
         messages=[{"role": "user", "content": EXTRACTION_PROMPT % message_text}],
     )
+    log_cost(costs_sheet, script="bot.py", category="extraction", response=resp, model=MODEL)
+
     text = resp.content[0].text.strip()
     if text.startswith("```"):
         text = text.split("```")[1]
@@ -130,22 +127,17 @@ def extract(message_text):
     try:
         return json.loads(text.strip())
     except json.JSONDecodeError:
-        print(f"  ! JSON parse failed. Raw response: {text[:300]}")
+        print(f"  ! JSON parse failed: {text[:300]}")
         return {"people": [], "links": [], "tasks": [], "ideas": [], "deals": []}
 
 
 def fetch_page(url):
-    """Fetch a page and return (title, cleaned_text). Returns (None, None) on failure."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     try:
-        with httpx.Client(
-            follow_redirects=True,
-            timeout=FETCH_TIMEOUT,
-            headers=headers,
-        ) as client:
+        with httpx.Client(follow_redirects=True, timeout=FETCH_TIMEOUT, headers=headers) as client:
             resp = client.get(url)
             if resp.status_code >= 400:
                 return None, None
@@ -154,37 +146,25 @@ def fetch_page(url):
         print(f"    fetch error: {e}")
         return None, None
 
-    # Extract title
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
     title = title_match.group(1).strip() if title_match else ""
     title = re.sub(r"\s+", " ", title)[:200]
 
-    # Strip script and style blocks
     html = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.IGNORECASE | re.DOTALL)
     html = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.IGNORECASE | re.DOTALL)
-
-    # Strip all other HTML tags
     text = re.sub(r"<[^>]+>", " ", html)
 
-    # Decode common HTML entities
-    replacements = {
-        "&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">",
-        "&quot;": '"', "&#39;": "'", "&apos;": "'",
-    }
-    for entity, char in replacements.items():
+    for entity, char in {"&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">",
+                          "&quot;": '"', "&#39;": "'", "&apos;": "'"}.items():
         text = text.replace(entity, char)
-
-    # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip()
 
     if len(text) < 100:
         return title, None
-
     return title, text[:FETCH_MAX_CHARS]
 
 
-def summarize_link(url, claude_title):
-    """Fetch page and generate a 2-3 sentence summary."""
+def summarize_link(url, claude_title, costs_sheet):
     print(f"    fetching: {url[:80]}")
     page_title, content = fetch_page(url)
     if not content:
@@ -192,13 +172,14 @@ def summarize_link(url, claude_title):
 
     try:
         resp = client_ai.messages.create(
-            model="claude-opus-4-5",
+            model=MODEL,
             max_tokens=256,
             messages=[{
                 "role": "user",
                 "content": SUMMARY_PROMPT % (url, page_title or claude_title or "", content),
             }],
         )
+        log_cost(costs_sheet, script="bot.py", category="link_summary", response=resp, model=MODEL)
         summary = resp.content[0].text.strip()
         if summary == "UNREADABLE" or not summary:
             return "Page content not readable."
@@ -208,7 +189,6 @@ def summarize_link(url, claude_title):
         return "Summary generation failed."
 
 
-# --- State ---
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
@@ -221,7 +201,6 @@ def save_state(state):
         json.dump(state, f)
 
 
-# --- Main ---
 async def main():
     sheets = get_sheets()
     state = load_state()
@@ -242,7 +221,7 @@ async def main():
 
         for msg in new_messages:
             print(f"Processing message {msg.id}: {msg.text[:60]}...")
-            result = extract(msg.text)
+            result = extract(msg.text, sheets["costs"])
             now = datetime.now(timezone.utc).isoformat()
             preview = msg.text[:200]
 
@@ -259,11 +238,11 @@ async def main():
                         "person", f"{name} - {context} [{types_str}]",
                         f"Low confidence ({conf:.2f})", f"{conf:.2f}", preview, now, "pending"
                     ])
-                    print(f"  ? Inbox person: {name} [conf={conf:.2f}]")
+                    print(f"  ? Inbox person: {name}")
                 else:
                     sheets["people"].append_row([name, context, types_str, "", now, preview, "FALSE"])
                     existing_names.add(name.lower())
-                    print(f"  + Person: {name} [{types_str}]")
+                    print(f"  + Person: {name}")
 
             for link in result.get("links", []):
                 url = link.get("url", "").strip()
@@ -277,11 +256,10 @@ async def main():
                         f"Low confidence ({conf:.2f})", f"{conf:.2f}", preview, now, "pending"
                     ])
                 else:
-                    summary = summarize_link(url, title)
-                    # Links: URL | Title | Summary | Captured At | Source Message | Sent in Digest
+                    summary = summarize_link(url, title, sheets["costs"])
                     sheets["links"].append_row([url, title, summary, now, preview, "FALSE"])
                     existing_urls.add(url)
-                    print(f"  + Link: {url[:50]} -> {summary[:60]}")
+                    print(f"  + Link: {url[:50]}")
 
             for t in result.get("tasks", []):
                 task_text = t.get("task", "").strip()
