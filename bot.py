@@ -51,18 +51,29 @@ A) ADDING A PERSON to their CRM. Signals: "add X to people", "met X", "X is inte
 
 B) SAVING A LINK to read later. Signals: a URL is present, optionally with a few words of context about what it is.
 
-C) CAPTURING A TASK they need to do. Signals: imperative phrasing directed at themselves like "email X", "book Y", "remind me to Z", "todo: ...", "need to ...", "follow up with X about Y", "draft the memo", "call the lawyer". The note is about an ACTION the writer needs to take.
+C) CAPTURING A TASK they need to do. Signals: imperative phrasing directed at themselves like "email X", "book Y", "remind me to Z", "need to ...", "follow up with X about Y", "draft the memo", "call the lawyer". The note is about an ACTION the writer needs to take.
 
-CRITICAL DISAMBIGUATION RULE: If a note is primarily ADDING A PERSON (purpose A), do NOT also extract a task from it, even if the description of the person sounds action-adjacent. For example:
-- "Add Sarah Chen to people - she can intro me to founders at Sequoia" -> ONE person (Sarah), ZERO tasks. The intro is a description of Sarah's usefulness, not a task.
-- "Met Marcus at dinner, he runs a family office and wants to invest in AI" -> ONE person, ZERO tasks.
+HARD TASK MARKERS: If the note begins with or contains any of these markers, it is DEFINITELY a task and you must extract it as a task, not a person, even if the note is short or mentions a person's name:
+- "todo:", "TODO:", "todo "
+- "remind me to"
+- "need to", "have to", "must"
+- "don't forget to"
+- "follow up"
+A note like "Todo: email Gerard" is a task ("Email Gerard"), NOT a person named Gerard. The person mentioned in a task is the OBJECT of the action, not a CRM entry.
+
+DISAMBIGUATION RULE: If a note is primarily ADDING A PERSON (purpose A), do NOT also extract a task from it. Examples:
+- "Add Sarah Chen to people - she can intro me to founders at Sequoia" -> ONE person, ZERO tasks.
+- "Met Marcus at dinner, he runs a family office" -> ONE person, ZERO tasks.
 - "Email Sarah about the deck tomorrow" -> ZERO people, ONE task.
-- "Met Sarah Chen at Sequoia. Need to email her the deck by Friday." -> ONE person AND ONE task (these are clearly separate clauses).
+- "Todo: email Gerard" -> ZERO people, ONE task ("Email Gerard").
+- "Met Sarah Chen at Sequoia. Need to email her the deck by Friday." -> ONE person AND ONE task (separate clauses).
+
+NAME FIDELITY RULE: When extracting a person's name, you MUST copy it verbatim from the source text. Do not correct spelling, do not guess at full names, do not substitute similar-sounding words. If the source says "Gerard", the name is "Gerard" - never "Harare" or "Gerald" or anything else. If you cannot find the exact name in the source, do not extract a person.
 
 Extract:
 
-1. PEOPLE - real humans named in the note. For each:
-   - name: as written
+1. PEOPLE - real humans named in the note (only when the note is ABOUT them, per the rules above). For each:
+   - name: copied verbatim from the source text
    - context: one sentence on who they are or why they're being added
    - types: lowercase tags inferred from context. Common: "investor", "vc", "angel", "deal source", "entrepreneur", "founder", "family office", "lp", "operator", "advisor", "lawyer", "banker", "family", "friend", "journalist", "recruiter". Multiple allowed. Empty list if no signal.
 
@@ -71,8 +82,8 @@ Extract:
    - title: short guess at what it is, based on surrounding context
 
 3. TASKS - action items the writer needs to do themselves. For each:
-   - task: rewrite the action as a clear imperative starting with a verb (e.g., "Email Sarah the deck")
-   - due: any date/time mentioned in natural language (e.g., "Friday", "tomorrow", "next week"), or empty string if none
+   - task: rewrite the action as a clear imperative starting with a verb (e.g., "Email Gerard")
+   - due: any date/time mentioned in natural language, or empty string if none
 
 Return ONLY valid JSON, no prose:
 {"people": [{"name": "...", "context": "...", "types": ["..."]}], "links": [{"url": "...", "title": "..."}], "tasks": [{"task": "...", "due": "..."}]}
@@ -98,6 +109,7 @@ def extract(message_text):
     try:
         return json.loads(text.strip())
     except json.JSONDecodeError:
+        print(f"  ! JSON parse failed. Raw response: {text[:300]}")
         return {"people": [], "links": [], "tasks": []}
 
 # --- State ---
