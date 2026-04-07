@@ -121,7 +121,7 @@ async def main():
             now = datetime.now(timezone.utc).isoformat()
             preview = msg.text[:200]
 
-        for p in result.get("people", []):
+            for p in result.get("people", []):
                 name = p.get("name", "").strip()
                 if not name or name.lower() in existing_names:
                     continue
