@@ -35,6 +35,14 @@ FETCH_TIMEOUT = 15
 FETCH_MAX_CHARS = 20000
 MODEL = "claude-opus-4-5"
 
+
+def safe_str(value):
+    """Return a stripped string from any value, handling None and non-strings safely."""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 # --- Sheets ---
 def get_sheets():
     creds = Credentials.from_service_account_info(
@@ -72,7 +80,7 @@ HARD TASK MARKERS: "todo:", "remind me to", "need to", "have to", "must", "don't
 
 DISAMBIGUATION:
 - A note that ADDS A PERSON should not also produce a task or idea.
-- A DEAL and a PERSON can co-occur (e.g., "Sarah pitched Acme Series A" -> 1 person + 1 deal).
+- A DEAL and a PERSON can co-occur.
 - An IDEA stands alone - not directed at anyone.
 - A DEAL has a specific company and concrete signals.
 
@@ -86,6 +94,8 @@ Extract:
 3. TASKS: task, due, confidence.
 4. IDEAS: idea, confidence.
 5. DEALS: company, terms, direction (looking/offering/tracking), timeline, deal_type (seed/series_a/series_b/series_c/series_d/growth/secondary/bridge/safe/convertible/m_and_a/non_venture/unknown), mentioned_by, confidence.
+
+For any field you don't have data for, use an empty string "" - never use null.
 
 Return ONLY valid JSON:
 {"people":[],"links":[],"tasks":[],"ideas":[],"deals":[]}
@@ -221,18 +231,27 @@ async def main():
 
         for msg in new_messages:
             print(f"Processing message {msg.id}: {msg.text[:60]}...")
-            result = extract(msg.text, sheets["costs"])
+            try:
+                result = extract(msg.text, sheets["costs"])
+            except Exception as e:
+                print(f"  ! Extraction error, skipping message: {e}")
+                state["last_id"] = max(state["last_id"], msg.id)
+                continue
+
             now = datetime.now(timezone.utc).isoformat()
             preview = msg.text[:200]
 
-            for p in result.get("people", []):
-                name = p.get("name", "").strip()
+            for p in result.get("people", []) or []:
+                name = safe_str(p.get("name"))
                 if not name or name.lower() in existing_names:
                     continue
-                conf = float(p.get("confidence", 1.0))
-                types_list = p.get("types", []) or []
-                types_str = ", ".join(x.strip().lower() for x in types_list if x.strip())
-                context = p.get("context", "")
+                try:
+                    conf = float(p.get("confidence", 1.0) or 1.0)
+                except (TypeError, ValueError):
+                    conf = 1.0
+                types_list = p.get("types") or []
+                types_str = ", ".join(safe_str(x).lower() for x in types_list if safe_str(x))
+                context = safe_str(p.get("context"))
                 if conf < CONFIDENCE_THRESHOLD:
                     sheets["inbox"].append_row([
                         "person", f"{name} - {context} [{types_str}]",
@@ -244,12 +263,15 @@ async def main():
                     existing_names.add(name.lower())
                     print(f"  + Person: {name}")
 
-            for link in result.get("links", []):
-                url = link.get("url", "").strip()
+            for link in result.get("links", []) or []:
+                url = safe_str(link.get("url"))
                 if not url or url in existing_urls:
                     continue
-                conf = float(link.get("confidence", 1.0))
-                title = link.get("title", "")
+                try:
+                    conf = float(link.get("confidence", 1.0) or 1.0)
+                except (TypeError, ValueError):
+                    conf = 1.0
+                title = safe_str(link.get("title"))
                 if conf < CONFIDENCE_THRESHOLD:
                     sheets["inbox"].append_row([
                         "link", f"{url} - {title}",
@@ -261,12 +283,15 @@ async def main():
                     existing_urls.add(url)
                     print(f"  + Link: {url[:50]}")
 
-            for t in result.get("tasks", []):
-                task_text = t.get("task", "").strip()
+            for t in result.get("tasks", []) or []:
+                task_text = safe_str(t.get("task"))
                 if not task_text:
                     continue
-                conf = float(t.get("confidence", 1.0))
-                due = t.get("due", "").strip()
+                try:
+                    conf = float(t.get("confidence", 1.0) or 1.0)
+                except (TypeError, ValueError):
+                    conf = 1.0
+                due = safe_str(t.get("due"))
                 if conf < CONFIDENCE_THRESHOLD:
                     sheets["inbox"].append_row([
                         "task", task_text + (f" (due {due})" if due else ""),
@@ -276,11 +301,14 @@ async def main():
                     sheets["tasks"].append_row([task_text, now, due, "pending", preview])
                     print(f"  + Task: {task_text[:50]}")
 
-            for idea in result.get("ideas", []):
-                idea_text = idea.get("idea", "").strip()
+            for idea in result.get("ideas", []) or []:
+                idea_text = safe_str(idea.get("idea"))
                 if not idea_text:
                     continue
-                conf = float(idea.get("confidence", 1.0))
+                try:
+                    conf = float(idea.get("confidence", 1.0) or 1.0)
+                except (TypeError, ValueError):
+                    conf = 1.0
                 if conf < CONFIDENCE_THRESHOLD:
                     sheets["inbox"].append_row([
                         "idea", idea_text,
@@ -290,16 +318,19 @@ async def main():
                     sheets["ideas"].append_row([idea_text, now, preview, "FALSE"])
                     print(f"  + Idea: {idea_text[:50]}")
 
-            for d in result.get("deals", []):
-                company = d.get("company", "").strip()
+            for d in result.get("deals", []) or []:
+                company = safe_str(d.get("company"))
                 if not company:
                     continue
-                conf = float(d.get("confidence", 1.0))
-                terms = d.get("terms", "")
-                direction = d.get("direction", "tracking")
-                timeline = d.get("timeline", "")
-                deal_type = d.get("deal_type", "unknown")
-                mentioned_by = d.get("mentioned_by", "")
+                try:
+                    conf = float(d.get("confidence", 1.0) or 1.0)
+                except (TypeError, ValueError):
+                    conf = 1.0
+                terms = safe_str(d.get("terms"))
+                direction = safe_str(d.get("direction")) or "tracking"
+                timeline = safe_str(d.get("timeline"))
+                deal_type = safe_str(d.get("deal_type")) or "unknown"
+                mentioned_by = safe_str(d.get("mentioned_by"))
                 if conf < CONFIDENCE_THRESHOLD:
                     sheets["inbox"].append_row([
                         "deal", f"{company} [{deal_type}] - {terms} ({direction})",
