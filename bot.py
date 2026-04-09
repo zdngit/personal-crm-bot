@@ -2,6 +2,8 @@
 Personal CRM Bot (Telegram)
 Extracts people, links, tasks, ideas, deals. Summarizes links.
 Logs every Claude API call to the Costs tab.
+Twitter/X links go through fxtwitter (with oEmbed fallback) since
+raw x.com HTML requires JavaScript and cannot be fetched directly.
 """
 import os
 import re
@@ -121,6 +123,17 @@ Content:
 Summary:"""
 
 
+TWEET_SUMMARY_PROMPT = """You will be given the text of a tweet (or thread). Write a 2-3 sentence summary that conveys what the author is saying and any key point or takeaway. Be concrete - just state the substance, don't say "this tweet says".
+
+Author: %s
+Tweet text:
+---
+%s
+---
+
+Summary:"""
+
+
 def extract(message_text, costs_sheet):
     resp = client_ai.messages.create(
         model=MODEL,
@@ -141,7 +154,75 @@ def extract(message_text, costs_sheet):
         return {"people": [], "links": [], "tasks": [], "ideas": [], "deals": []}
 
 
+# --- URL helpers ---
+
+TWITTER_HOSTS = {"twitter.com", "x.com", "www.twitter.com", "www.x.com", "mobile.twitter.com", "mobile.x.com"}
+
+
+def is_twitter_url(url):
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lower()
+        return host in TWITTER_HOSTS
+    except Exception:
+        return False
+
+
+def fetch_tweet(url):
+    """
+    Fetch a tweet's content via fxtwitter (primary) or Twitter oEmbed (fallback).
+    Returns (author, text) or (None, None) on failure.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; CRMBot/1.0)",
+        "Accept": "application/json",
+    }
+
+    # Attempt 1: fxtwitter JSON API - returns clean tweet text
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        # fxtwitter exposes tweets at api.fxtwitter.com/{user}/status/{id}
+        # We pass through the original path after the host
+        path = parsed.path
+        fx_url = f"https://api.fxtwitter.com{path}"
+        with httpx.Client(follow_redirects=True, timeout=FETCH_TIMEOUT, headers=headers) as client:
+            resp = client.get(fx_url)
+            if resp.status_code == 200:
+                data = resp.json()
+                tweet = data.get("tweet") or {}
+                text = tweet.get("text") or ""
+                author = (tweet.get("author") or {}).get("name") or ""
+                if text:
+                    print(f"    fxtwitter: got {len(text)} chars")
+                    return author, text
+    except Exception as e:
+        print(f"    fxtwitter failed: {e}")
+
+    # Attempt 2: Twitter's official oEmbed endpoint
+    try:
+        oembed_url = f"https://publish.twitter.com/oembed?url={url}&dnt=true&omit_script=true"
+        with httpx.Client(follow_redirects=True, timeout=FETCH_TIMEOUT, headers=headers) as client:
+            resp = client.get(oembed_url)
+            if resp.status_code == 200:
+                data = resp.json()
+                html = data.get("html", "")
+                author = data.get("author_name", "")
+                # Strip HTML tags and unescape
+                text = re.sub(r"<[^>]+>", " ", html)
+                text = re.sub(r"\s+", " ", text).strip()
+                # oEmbed HTML includes a trailing "— Author (@handle) date" that we can keep
+                if text:
+                    print(f"    oembed: got {len(text)} chars")
+                    return author, text
+    except Exception as e:
+        print(f"    oembed failed: {e}")
+
+    return None, None
+
+
 def fetch_page(url):
+    """Fetch a normal (non-tweet) web page and return (title, cleaned_text)."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -175,6 +256,29 @@ def fetch_page(url):
 
 
 def summarize_link(url, claude_title, costs_sheet):
+    """Route to tweet handler or regular page handler based on the URL."""
+    if is_twitter_url(url):
+        print(f"    tweet: {url[:80]}")
+        author, text = fetch_tweet(url)
+        if not text:
+            return "Unable to fetch tweet for summary."
+        try:
+            resp = client_ai.messages.create(
+                model=MODEL,
+                max_tokens=256,
+                messages=[{
+                    "role": "user",
+                    "content": TWEET_SUMMARY_PROMPT % (author or "Unknown", text),
+                }],
+            )
+            log_cost(costs_sheet, script="bot.py", category="link_summary", response=resp, model=MODEL)
+            summary = resp.content[0].text.strip()
+            return summary or "Tweet summary unavailable."
+        except Exception as e:
+            print(f"    summary error: {e}")
+            return "Summary generation failed."
+
+    # Regular web page
     print(f"    fetching: {url[:80]}")
     page_title, content = fetch_page(url)
     if not content:
